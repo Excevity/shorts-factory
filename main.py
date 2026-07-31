@@ -85,7 +85,12 @@ class NoStoryError(PipelineError):
 
 
 class ScriptError(PipelineError):
-    """Gemini refused, rate-limited, or returned something unusable."""
+    """Gemini refused or returned something unusable for THIS story."""
+
+
+class RateLimitError(PipelineError):
+    """Gemini's free-tier quota is exhausted. Retrying other stories will not
+    help - it would only burn more quota - so this aborts the whole run."""
 
 
 class NarrationError(PipelineError):
@@ -156,7 +161,8 @@ class Config:
     fallback_voice: str = "en-US-GuyNeural"
     speech_rate: str = "+8%"
     upload_privacy: str = "private"
-    gemini_model: str = "gemini-2.0-flash"
+    # Tried in order. If one is rate limited or retired, the next is used.
+    gemini_models: list[str] = field(default_factory=list)
     state_file: Path = Path("state/processed.json")
     output_dir: Path = Path("output")
     dry_run: bool = False
@@ -193,7 +199,13 @@ class Config:
             fallback_voice=_env("TTS_FALLBACK_VOICE", "en-US-GuyNeural") or "en-US-GuyNeural",
             speech_rate=_env("TTS_RATE", "+8%") or "+8%",
             upload_privacy=privacy,
-            gemini_model=_env("GEMINI_MODEL", "gemini-2.0-flash") or "gemini-2.0-flash",
+            gemini_models=[
+                m.strip() for m in (
+                    _env("GEMINI_MODELS",
+                         "gemini-2.5-flash,gemini-2.0-flash,gemini-2.5-flash-lite")
+                    or ""
+                ).split(",") if m.strip()
+            ] or ["gemini-2.5-flash"],
             state_file=Path(_env("STATE_FILE", "state/processed.json")
                             or "state/processed.json"),
             output_dir=Path(_env("OUTPUT_DIR", "output") or "output"),
@@ -461,11 +473,16 @@ class ScriptWriter:
     AUTH_MODES = ("header", "bearer", "query")
     # ~150 words per minute is a natural narration pace.
     WORDS_PER_SECOND = 2.5
+    # Free tier allows only 5-15 requests per minute, so every call counts.
+    MAX_CALLS_PER_RUN = 8
+    MAX_WAIT = 75.0
 
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.session = requests.Session()
         self._auth_mode: str | None = None
+        self._models = list(cfg.gemini_models)
+        self._calls = 0
 
     def write(self, story: Story) -> VideoScript:
         target = self.cfg.target_seconds
@@ -495,24 +512,34 @@ class ScriptWriter:
         return self.session.post(url, params=params, headers=headers,
                                  json=payload, timeout=120)
 
-    @retry(times=3, delay=8.0, exceptions=(requests.RequestException, ScriptError))
-    def _generate(self, prompt: str) -> str:
-        url = f"{self.BASE}/{self.cfg.gemini_model}:generateContent"
-        payload = {
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.85,
-                "maxOutputTokens": 1200,
-                "responseMimeType": "application/json",
-            },
-        }
+    @staticmethod
+    def _retry_after(resp: requests.Response) -> float | None:
+        """Google tells us how long to wait; obey it instead of guessing."""
+        header = resp.headers.get("Retry-After")
+        if header:
+            try:
+                return float(header)
+            except ValueError:
+                pass
+        try:
+            for detail in (resp.json().get("error") or {}).get("details") or []:
+                delay = str(detail.get("retryDelay") or "")
+                match = re.match(r"([\d.]+)s", delay)
+                if match:
+                    return float(match.group(1))
+        except ValueError:
+            pass
+        return None
 
+    def _call(self, model: str, payload: dict[str, Any]) -> requests.Response:
+        url = f"{self.BASE}/{model}:generateContent"
         # Google is midway through changing key formats: old "AIza" keys work as
         # a ?key= parameter, new "AQ." keys must go in a header. Try each once,
         # then remember whichever worked.
         modes = (self._auth_mode,) if self._auth_mode else self.AUTH_MODES
         resp, rejected = None, []
         for mode in modes:
+            self._calls += 1
             resp = self._send(url, payload, mode)
             if resp.status_code in (401, 403) and not self._auth_mode:
                 rejected.append(f"{mode}={resp.status_code}")
@@ -523,27 +550,82 @@ class ScriptWriter:
 
         if resp is None:  # pragma: no cover - defensive
             raise ScriptError("Gemini request was never sent.")
-        if resp.status_code in (401, 403):
+        if resp.status_code in (401, 403) and rejected:
             raise ConfigError(
                 f"Gemini rejected your API key with every auth style ({', '.join(rejected)}). "
                 f"Key starts with '{self.cfg.gemini_api_key[:4]}'. If it starts with 'AQ.', "
                 "make a replacement key in the Google Cloud Console instead of AI Studio - "
                 f"see the README. Server said: {resp.text[:250]}"
             )
-        if resp.status_code == 429:
-            raise ScriptError("Gemini free-tier rate limit hit (429).")
-        if resp.status_code >= 400:
-            raise ScriptError(f"Gemini HTTP {resp.status_code}: {resp.text[:300]}")
+        return resp
 
-        data = resp.json()
-        candidates = data.get("candidates") or []
-        if not candidates:
-            raise ScriptError(f"Gemini returned nothing. {data.get('promptFeedback', {})}")
-        parts = (candidates[0].get("content") or {}).get("parts") or []
-        text = "".join(p.get("text", "") for p in parts).strip()
-        if not text:
-            raise ScriptError("Gemini returned an empty body.")
-        return text
+    def _generate(self, prompt: str) -> str:
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.85,
+                "maxOutputTokens": 1200,
+                "responseMimeType": "application/json",
+            },
+        }
+
+        throttled: list[str] = []
+        for model in list(self._models):
+            for attempt in (1, 2):
+                if self._calls >= self.MAX_CALLS_PER_RUN:
+                    raise RateLimitError(
+                        f"Used the {self.MAX_CALLS_PER_RUN}-call Gemini budget for this "
+                        "run without a usable script. Stopping so the daily free quota "
+                        "is not burned. The next slot will try again."
+                    )
+                try:
+                    resp = self._call(model, payload)
+                except requests.RequestException as exc:
+                    log.warning("Gemini network error on %s: %s", model, str(exc)[:140])
+                    time.sleep(5)
+                    continue
+
+                if resp.status_code == 429:
+                    wait = self._retry_after(resp)
+                    if wait is not None and wait <= self.MAX_WAIT and attempt == 1:
+                        log.warning("%s is rate limited; Google says wait %.0fs.", model, wait)
+                        time.sleep(wait + 1)
+                        continue
+                    log.warning("%s is rate limited (429) - trying the next model.", model)
+                    throttled.append(model)
+                    self._models = [m for m in self._models if m != model]
+                    break
+
+                if resp.status_code == 404 or (
+                    resp.status_code == 400 and "not found" in resp.text.lower()
+                ):
+                    log.warning("Model %s is not available on this key - dropping it.", model)
+                    self._models = [m for m in self._models if m != model]
+                    break
+
+                if resp.status_code >= 400:
+                    raise ScriptError(f"Gemini HTTP {resp.status_code}: {resp.text[:250]}")
+
+                data = resp.json()
+                candidates = data.get("candidates") or []
+                if not candidates:
+                    raise ScriptError(
+                        f"Gemini returned nothing. {data.get('promptFeedback', {})}"
+                    )
+                parts = (candidates[0].get("content") or {}).get("parts") or []
+                text = "".join(p.get("text", "") for p in parts).strip()
+                if not text:
+                    raise ScriptError("Gemini returned an empty body.")
+                if model != self.cfg.gemini_models[0]:
+                    log.info("Script written by fallback model %s.", model)
+                return text
+
+        raise RateLimitError(
+            "Every Gemini model is rate limited or unavailable "
+            f"(tried: {', '.join(throttled) or 'none'}). The free tier allows only "
+            "5-15 requests per minute and a limited number per day. Nothing was "
+            "posted this slot; the next one will try again."
+        )
 
     # -- parsing ------------------------------------------------------------
 
@@ -1167,7 +1249,9 @@ def produce(cfg: Config, workdir: Path, state: State) -> tuple[Path, VideoScript
     tally: dict[str, int] = {}
     last_error: Exception | None = None
 
-    for index, story in enumerate(fresh[:6], start=1):
+    # Only a few attempts: each one costs a Gemini call, and the free tier is
+    # measured in single-digit requests per minute.
+    for index, story in enumerate(fresh[:4], start=1):
         log.info("-" * 70)
         log.info("Story %d: %s", index, story.title)
         log.info("         %s | %.0fh old", story.source, story.age_hours)
@@ -1269,6 +1353,13 @@ def main() -> int:
                                "result": "render ok, upload failed", "detail": str(exc)[:400]})
                 exit_code = 1
 
+    except RateLimitError as exc:
+        log.warning("Gemini quota exhausted: %s", exc)
+        write_summary({"slot": slot, "result": "rate limited (Gemini)",
+                       "detail": str(exc)[:500],
+                       "what to do": "Nothing - the next slot retries. If it happens "
+                                     "every slot, your daily free quota is used up."})
+        exit_code = 0   # not a build failure, just a quiet slot
     except NoStoryError as exc:
         log.warning("Nothing posted this run: %s", exc)
         write_summary({"slot": slot, "result": "no story", "detail": str(exc)[:500]})
