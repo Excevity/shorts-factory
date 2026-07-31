@@ -114,9 +114,10 @@ jobs:
           # --- tuning knobs (edit these freely, they are not secret) --
           # More queries + more candidates, because we now burn 3 source
           # videos every day instead of 1.
-          SEARCH_QUERIES: "artificial intelligence explained,AI tools 2026,machine learning breakthrough,tech news AI,large language models,AI agents,future of technology,AI startup,AI coding assistant,robotics and AI,AI research paper explained,generative AI"
-          DAYS_BACK: "60"
-          MAX_CANDIDATES: "15"
+          # Gaming first (bigger Creative Commons pool), then tech/AI.
+          SEARCH_QUERIES: "new game release review,most hyped games 2026,upcoming games 2026,game review,gameplay walkthrough,gaming news,indie game review,game first impressions,game trailer reaction,best games 2026,game development,speedrun,esports highlights,artificial intelligence explained,AI tools 2026,tech news AI,large language models,AI agents,generative AI"
+          DAYS_BACK: "90"
+          MAX_CANDIDATES: "25"
           MIN_CLIP_SECONDS: "45"
           MAX_CLIP_SECONDS: "59"
           CROP_MODE: "blur"
