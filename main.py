@@ -163,6 +163,10 @@ class Config:
     upload_privacy: str = "private"
     # Tried in order. If one is rate limited or retired, the next is used.
     gemini_models: list[str] = field(default_factory=list)
+    # New York hours we aim to post at, and how late a run may arrive and still
+    # count. GitHub's scheduler is frequently 30-90 minutes late.
+    post_hours: list[int] = field(default_factory=lambda: [10, 12, 14])
+    grace_minutes: int = 115
     state_file: Path = Path("state/processed.json")
     output_dir: Path = Path("output")
     dry_run: bool = False
@@ -206,6 +210,11 @@ class Config:
                     or ""
                 ).split(",") if m.strip()
             ] or ["gemini-2.5-flash"],
+            post_hours=[
+                int(h) for h in (_env("POST_HOURS", "10,12,14") or "").split(",")
+                if h.strip().isdigit()
+            ] or [10, 12, 14],
+            grace_minutes=_int("GRACE_MINUTES", 115),
             state_file=Path(_env("STATE_FILE", "state/processed.json")
                             or "state/processed.json"),
             output_dir=Path(_env("OUTPUT_DIR", "output") or "output"),
@@ -606,15 +615,26 @@ class ScriptWriter:
             )
         return resp
 
-    def _generate(self, prompt: str) -> str:
-        payload = {
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.85,
-                "maxOutputTokens": 1200,
-                "responseMimeType": "application/json",
-            },
+    def _payload(self, prompt: str, model: str) -> dict[str, Any]:
+        config: dict[str, Any] = {
+            "temperature": 0.85,
+            # Was 1200, which truncated replies mid-sentence and produced
+            # unparseable JSON. Reasoning models also spend this budget on
+            # internal thinking before writing a single visible character.
+            "maxOutputTokens": 4096,
+            "responseMimeType": "application/json",
         }
+        # Turn off "thinking" on models that support it - we want the whole
+        # budget spent on the answer, not on hidden reasoning.
+        if re.search(r"2\.5|[3-9]\.", model):
+            config["thinkingConfig"] = {"thinkingBudget": 0}
+        return {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": config,
+        }
+
+    def _generate(self, prompt: str) -> str:
+        payload: dict[str, Any] = {}
 
         throttled: list[str] = []
         for model in list(self._models):
@@ -625,6 +645,7 @@ class ScriptWriter:
                         "run without a usable script. Stopping so the daily free quota "
                         "is not burned. The next slot will try again."
                     )
+                payload = self._payload(prompt, model)
                 try:
                     resp = self._call(model, payload)
                 except requests.RequestException as exc:
@@ -662,10 +683,20 @@ class ScriptWriter:
                     raise ScriptError(
                         f"Gemini returned nothing. {data.get('promptFeedback', {})}"
                     )
+                finish = str(candidates[0].get("finishReason") or "")
                 parts = (candidates[0].get("content") or {}).get("parts") or []
                 text = "".join(p.get("text", "") for p in parts).strip()
+
+                if finish == "MAX_TOKENS":
+                    log.warning("%s hit the output limit - the reply is cut short.", model)
+                if finish in ("SAFETY", "RECITATION", "PROHIBITED_CONTENT", "BLOCKLIST"):
+                    raise ScriptError(
+                        f"Gemini refused this story ({finish}). Trying a different story."
+                    )
                 if not text:
-                    raise ScriptError("Gemini returned an empty body.")
+                    raise ScriptError(
+                        f"Gemini returned an empty body (finishReason={finish or 'unknown'})."
+                    )
                 if model != self.cfg.gemini_models[0]:
                     log.info("Script written by fallback model %s.", model)
                 return text
@@ -698,15 +729,65 @@ class ScriptWriter:
     # -- parsing ------------------------------------------------------------
 
     @staticmethod
-    def _parse(raw: str) -> VideoScript:
-        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
-        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+    def _salvage(text: str) -> dict[str, Any] | None:
+        """Rescue a truncated reply.
+
+        If the model runs out of output budget the JSON has no closing brace,
+        so json.loads fails outright. The narration is the only field we truly
+        need, and it is written first - so pull it out directly and fall back to
+        sensible defaults for the rest rather than binning a usable script.
+        """
+        match = re.search(r'"narration"\s*:\s*"((?:[^"\\]|\\.)*)', text, flags=re.DOTALL)
         if not match:
-            raise ScriptError(f"No JSON found in Gemini output: {raw[:200]}")
+            return None
         try:
-            obj = json.loads(match.group(0))
-        except json.JSONDecodeError as exc:
-            raise ScriptError(f"Gemini JSON was malformed: {exc}") from exc
+            narration = json.loads(f'"{match.group(1)}"')
+        except json.JSONDecodeError:
+            narration = match.group(1).replace('\\"', '"').replace("\\n", " ")
+        narration = narration.strip()
+        # Drop a trailing partial sentence left behind by the cut.
+        cut = max(narration.rfind("."), narration.rfind("!"), narration.rfind("?"))
+        if cut > 60:
+            narration = narration[: cut + 1]
+        if len(narration.split()) < 25:
+            return None
+
+        def field(name: str) -> str:
+            hit = re.search(rf'"{name}"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+            return hit.group(1).strip() if hit else ""
+
+        def array(name: str) -> list[str]:
+            hit = re.search(rf'"{name}"\s*:\s*\[(.*?)\]', text, flags=re.DOTALL)
+            return re.findall(r'"([^"]+)"', hit.group(1)) if hit else []
+
+        log.warning("Gemini's reply was cut short - salvaged the narration (%d words).",
+                    len(narration.split()))
+        return {
+            "narration": narration,
+            "title": field("title"),
+            "description": field("description"),
+            "hashtags": array("hashtags"),
+            "broll": array("broll"),
+        }
+
+    @classmethod
+    def _parse(cls, raw: str) -> VideoScript:
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
+        obj: dict[str, Any] | None = None
+
+        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+        if match:
+            try:
+                obj = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                obj = None
+
+        if obj is None:
+            obj = cls._salvage(cleaned)
+        if obj is None:
+            raise ScriptError(
+                f"Could not read Gemini's reply (len={len(cleaned)}): {cleaned[:220]}"
+            )
 
         def as_list(value: Any, limit: int) -> list[str]:
             if isinstance(value, str):
@@ -1359,6 +1440,42 @@ def produce(cfg: Config, workdir: Path, state: State) -> tuple[Path, VideoScript
     raise NoStoryError(f"Could not produce a video ({breakdown}). Last error: {last_error}")
 
 
+SLOT_NAMES = {10: "10am", 11: "11am", 12: "12pm", 13: "1pm", 14: "2pm",
+              15: "3pm", 16: "4pm", 17: "5pm", 18: "6pm", 19: "7pm",
+              8: "8am", 9: "9am"}
+
+
+def new_york_now() -> datetime:
+    try:
+        from zoneinfo import ZoneInfo
+
+        return datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        log.warning("No timezone database available - falling back to UTC.")
+        return datetime.now(timezone.utc)
+
+
+def choose_slot(now: datetime, hours: list[int], grace: int) -> tuple[str, str] | None:
+    """Work out which posting slot a run belongs to.
+
+    GitHub's scheduler routinely delivers runs 30-90 minutes late. Matching on
+    the exact hour therefore throws away perfectly good runs - which is exactly
+    what used to happen. Instead each target hour owns a window that stays open
+    for `grace` minutes, and a late run still counts for the slot it missed.
+    """
+    chosen: tuple[str, str] | None = None
+    for hour in sorted(hours):
+        target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        late_by = (now - target).total_seconds() / 60
+        if 0 <= late_by <= grace:
+            name = SLOT_NAMES.get(hour, f"{hour}h")
+            chosen = (f"{now.strftime('%Y-%m-%d')}:{name}", name)
+            if late_by > 5:
+                log.info("This run is %.0f min late for the %s slot - still counting it.",
+                         late_by, name)
+    return chosen
+
+
 def write_summary(payload: dict[str, Any]) -> None:
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not path:
@@ -1394,22 +1511,27 @@ def main() -> int:
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     state = State(cfg.state_file)
 
-    # Each posting slot is attempted more than once, because GitHub's free
-    # scheduler frequently delays or silently drops runs. This makes the extra
-    # attempts harmless: if the slot already produced a video today, stop here.
+    # Decide which posting slot this run belongs to. Done here rather than in
+    # the workflow because it needs the state file: GitHub delivers runs late,
+    # so we accept a late run for the slot it missed, but only once per slot.
     slot_key = ""
     if slot != "manual":
-        try:
-            from zoneinfo import ZoneInfo
-
-            today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
-        except Exception:
-            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        slot_key = f"{today}:{slot}"
+        now = new_york_now()
+        log.info("New York local time: %s", now.strftime("%Y-%m-%d %H:%M"))
+        chosen = choose_slot(now, cfg.post_hours, cfg.grace_minutes)
+        if not chosen:
+            nxt = ", ".join(f"{h}:00" for h in sorted(cfg.post_hours))
+            log.info("Not inside a posting window (targets: %s). Nothing to do.", nxt)
+            write_summary({"result": "outside posting window",
+                           "local time": now.strftime("%H:%M"),
+                           "targets": nxt})
+            return 0
+        slot_key, slot = chosen
+        log.info("This run counts as the %s slot.", slot)
         if state.slot_done(slot_key):
             log.info("The %s slot already posted today - nothing to do.", slot)
             write_summary({"slot": slot, "result": "already posted today",
-                           "detail": "This is a backup attempt; the slot succeeded earlier."})
+                           "detail": "Backup attempt; this slot already succeeded."})
             return 0
     workdir = Path(tempfile.mkdtemp(prefix="shorts_"))
     log.info("Working directory: %s", workdir)
