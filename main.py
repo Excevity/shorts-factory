@@ -927,15 +927,45 @@ def write_cookie_file(cfg: Config, workdir: Path) -> Path | None:
     """Turn the YT_COOKIES secret into a file yt-dlp can read. Shared by the
     transcript fetcher and the downloader so both get the same session."""
     if not cfg.yt_cookies:
+        log.info("No YT_COOKIES secret set. If YouTube blocks this runner, add one.")
         return None
-    path = workdir / "cookies.txt"
+
     # GitHub Secrets sometimes collapse literal \n - repair them.
-    content = cfg.yt_cookies.replace("\\n", "\n")
+    content = cfg.yt_cookies.replace("\\n", "\n").replace("\r\n", "\n")
     if not content.endswith("\n"):
         content += "\n"
+
+    # yt-dlp demands the Netscape header. Pasting the wrong thing (JSON, a
+    # header string, a half-copied file) is the single most common mistake,
+    # so fail loudly here rather than 25 confusing candidate failures later.
+    first = content.lstrip().split("\n", 1)[0].strip()
+    if not first.startswith(("# HTTP Cookie File", "# Netscape HTTP Cookie File")):
+        # A real Netscape cookie line has 7 tab-separated fields, so 6 tabs.
+        if content.count("\t") >= 6:
+            # Right shape, missing header - just add it.
+            content = "# Netscape HTTP Cookie File\n" + content
+            log.warning("YT_COOKIES was missing its header line - added it.")
+        else:
+            raise ConfigError(
+                "YT_COOKIES does not look like a Netscape cookies.txt file. It must "
+                "start with '# Netscape HTTP Cookie File' and contain tab-separated "
+                f"lines. Yours starts with: {first[:60]!r}. Re-export it with a "
+                "'Get cookies.txt LOCALLY' browser extension and paste the whole file."
+            )
+
+    lines = [l for l in content.split("\n") if l.strip() and not l.startswith("#")]
+    youtube_lines = [l for l in lines if "youtube.com" in l or "google.com" in l]
+    if not youtube_lines:
+        raise ConfigError(
+            f"YT_COOKIES has {len(lines)} cookie line(s) but none for youtube.com. "
+            "Export the cookies while you are ON youtube.com and signed in."
+        )
+
+    path = workdir / "cookies.txt"
     path.write_text(content, encoding="utf-8")
     os.chmod(path, 0o600)
-    log.info("Using supplied YouTube cookies.")
+    log.info("Loaded YT_COOKIES (%d cookies, %d for YouTube/Google).",
+             len(lines), len(youtube_lines))
     return path
 
 
