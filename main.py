@@ -521,6 +521,44 @@ class ScriptWriter:
         return self.session.post(url, params=params, headers=headers,
                                  json=payload, timeout=120)
 
+    def list_models(self) -> list[str]:
+        """Ask the key which models it can actually use.
+
+        Worth one extra call when things fail: 'model not available' plus
+        'rate limited' usually means the key is attached to a project where the
+        Generative Language API was never enabled, and this says so plainly.
+        """
+        try:
+            headers, params = {}, {}
+            if self._auth_mode == "query" or self._auth_mode is None:
+                params["key"] = self.cfg.gemini_api_key
+            if self._auth_mode in ("header", None):
+                headers["x-goog-api-key"] = self.cfg.gemini_api_key
+            resp = self.session.get(self.BASE, headers=headers, params=params, timeout=30)
+            if resp.status_code >= 400:
+                log.warning("Could not list models (HTTP %s): %s",
+                            resp.status_code, resp.text[:250])
+                return []
+            names = []
+            for model in resp.json().get("models") or []:
+                if "generateContent" in (model.get("supportedGenerationMethods") or []):
+                    names.append(str(model.get("name", "")).replace("models/", ""))
+            return names
+        except Exception as exc:
+            log.warning("Could not list models: %s", str(exc)[:150])
+            return []
+
+    @staticmethod
+    def _error_text(resp: requests.Response) -> str:
+        """Pull Google's human-readable reason out of an error response."""
+        try:
+            err = (resp.json().get("error") or {})
+            message = str(err.get("message") or "")[:300]
+            status = str(err.get("status") or "")
+            return f"{status}: {message}" if status else message
+        except ValueError:
+            return resp.text[:250]
+
     @staticmethod
     def _retry_after(resp: requests.Response) -> float | None:
         """Google tells us how long to wait; obey it instead of guessing."""
@@ -595,12 +633,14 @@ class ScriptWriter:
                     continue
 
                 if resp.status_code == 429:
+                    reason = self._error_text(resp)
                     wait = self._retry_after(resp)
                     if wait is not None and wait <= self.MAX_WAIT and attempt == 1:
-                        log.warning("%s is rate limited; Google says wait %.0fs.", model, wait)
+                        log.warning("%s rate limited; Google says wait %.0fs. Reason: %s",
+                                    model, wait, reason)
                         time.sleep(wait + 1)
                         continue
-                    log.warning("%s is rate limited (429) - trying the next model.", model)
+                    log.warning("%s rate limited (429). Reason: %s", model, reason)
                     throttled.append(model)
                     self._models = [m for m in self._models if m != model]
                     break
@@ -608,7 +648,8 @@ class ScriptWriter:
                 if resp.status_code == 404 or (
                     resp.status_code == 400 and "not found" in resp.text.lower()
                 ):
-                    log.warning("Model %s is not available on this key - dropping it.", model)
+                    log.warning("Model %s unavailable on this key. Reason: %s",
+                                model, self._error_text(resp))
                     self._models = [m for m in self._models if m != model]
                     break
 
@@ -629,11 +670,29 @@ class ScriptWriter:
                     log.info("Script written by fallback model %s.", model)
                 return text
 
+        # Everything failed. Spend one more call finding out what this key can
+        # actually do - that distinguishes "genuinely busy" from "misconfigured".
+        available = self.list_models()
+        if available:
+            log.info("This key CAN use: %s", ", ".join(available[:14]))
+            untried = [m for m in available if m not in throttled]
+            hint = (
+                f"Your key does have access to {len(available)} model(s). Set "
+                f"GEMINI_MODELS in automate.yml to one of these: {', '.join(untried[:5])}."
+                if untried else
+                "Every model your key can use is currently rate limited - wait it out."
+            )
+        else:
+            hint = (
+                "This key could not list ANY usable models, which normally means the "
+                "Generative Language API is not enabled on the key's Google Cloud "
+                "project (Google reports that as a 429 with a limit of 0, not a clear "
+                "error). Fix: Cloud Console -> select the shorts-factory project -> "
+                "search 'Generative Language API' -> Enable -> then Credentials -> "
+                "Create API key, and use that key as GEMINI_API_KEY."
+            )
         raise RateLimitError(
-            "Every Gemini model is rate limited or unavailable "
-            f"(tried: {', '.join(throttled) or 'none'}). The free tier allows only "
-            "5-15 requests per minute and a limited number per day. Nothing was "
-            "posted this slot; the next one will try again."
+            f"No Gemini model worked (tried: {', '.join(throttled) or 'none'}). {hint}"
         )
 
     # -- parsing ------------------------------------------------------------
