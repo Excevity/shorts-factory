@@ -6,8 +6,14 @@ on:
   # 15:00 / 17:00 / 19:00 UTC; in summer (EDT) they are 14:00 / 16:00 / 18:00 UTC.
   # So we fire at all six hours and let the guard step below cancel the three
   # that are not actually a target hour in New York today.
+  # Two things to know about GitHub's free scheduler:
+  #  1. It is busiest exactly on the hour, so runs at :00 are the most likely
+  #     to be delayed by an hour or dropped entirely. We use :07 and :37.
+  #  2. It drops runs anyway. So each posting slot gets TWO attempts, 30
+  #     minutes apart. main.py records which slot already posted today and
+  #     exits immediately on the backup attempt, so you never get doubles.
   schedule:
-    - cron: "0 14,15,16,17,18,19 * * *"
+    - cron: "7,37 14,15,16,17,18,19 * * *"
 
   # Lets you press a "Run workflow" button manually in the Actions tab.
   workflow_dispatch:
