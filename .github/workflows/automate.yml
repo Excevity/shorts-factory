@@ -1,0 +1,163 @@
+name: Daily Shorts Factory
+
+on:
+  # GitHub's scheduler ONLY understands UTC and has no idea about daylight saving.
+  # We want 10 AM, 12 PM and 2 PM New York time. In winter (EST) those are
+  # 15:00 / 17:00 / 19:00 UTC; in summer (EDT) they are 14:00 / 16:00 / 18:00 UTC.
+  # So we fire at all six hours and let the guard step below cancel the three
+  # that are not actually a target hour in New York today.
+  schedule:
+    - cron: "0 14,15,16,17,18,19 * * *"
+
+  # Lets you press a "Run workflow" button manually in the Actions tab.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build the clip but do NOT upload it anywhere"
+        type: boolean
+        default: false
+      privacy:
+        description: "YouTube privacy for this run"
+        type: choice
+        options: [private, unlisted, public]
+        default: private
+
+# Needed so the workflow can commit the 'already used' list back to the repo.
+permissions:
+  contents: write
+
+# Never run two of these at once - they would fight over the state file.
+concurrency:
+  group: shorts-factory
+  cancel-in-progress: false
+
+jobs:
+  create-and-post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      # ---------------------------------------------------------------
+      # 0. Only continue if it is 10 AM, 12 PM or 2 PM in New York.
+      #    (Skipped entirely when you click "Run workflow" yourself.)
+      # ---------------------------------------------------------------
+      - name: Check New York local time
+        id: clock
+        run: |
+          HOUR=$(TZ="America/New_York" date +%H)
+          echo "New York local time is ${HOUR}:00"
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "Manual run - going ahead regardless of the clock."
+            echo "run=true"  >> "$GITHUB_OUTPUT"
+            echo "slot=manual" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          case "$HOUR" in
+            10) echo "run=true"  >> "$GITHUB_OUTPUT"; echo "slot=10am" >> "$GITHUB_OUTPUT" ;;
+            12) echo "run=true"  >> "$GITHUB_OUTPUT"; echo "slot=12pm" >> "$GITHUB_OUTPUT" ;;
+            14) echo "run=true"  >> "$GITHUB_OUTPUT"; echo "slot=2pm"  >> "$GITHUB_OUTPUT" ;;
+            *)  echo "run=false" >> "$GITHUB_OUTPUT"
+                echo "Not a posting slot - this is the daylight-saving twin. Skipping." ;;
+          esac
+
+      - name: Checkout repository
+        if: steps.clock.outputs.run == 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        if: steps.clock.outputs.run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        if: steps.clock.outputs.run == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify FFmpeg is available
+        if: steps.clock.outputs.run == 'true'
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            echo "FFmpeg missing on this runner image - installing it."
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ffmpeg
+          fi
+          ffmpeg -version | head -n 1
+          ffprobe -version | head -n 1
+
+      # ---------------------------------------------------------------
+      # 1. Make sure we have the newest 'already used' list.
+      #    Three runs a day share this file, so pull before starting.
+      # ---------------------------------------------------------------
+      - name: Refresh the processed-videos list
+        if: steps.clock.outputs.run == 'true'
+        run: git pull --ff-only origin "${GITHUB_REF_NAME}" || true
+
+      # ---------------------------------------------------------------
+      # 2. The actual pipeline.
+      # ---------------------------------------------------------------
+      - name: Run the Shorts Factory (${{ steps.clock.outputs.slot }} slot)
+        if: steps.clock.outputs.run == 'true'
+        env:
+          # --- required secrets -------------------------------------
+          YOUTUBE_API_KEY:     ${{ secrets.YOUTUBE_API_KEY }}
+          GEMINI_API_KEY:      ${{ secrets.GEMINI_API_KEY }}
+          YT_CLIENT_ID:        ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET:    ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN:    ${{ secrets.YT_REFRESH_TOKEN }}
+          # --- optional secrets (leave unset and they are skipped) ---
+          YT_COOKIES:          ${{ secrets.YT_COOKIES }}
+          PROXY_URL:           ${{ secrets.PROXY_URL }}
+          # --- tuning knobs (edit these freely, they are not secret) --
+          # More queries + more candidates, because we now burn 3 source
+          # videos every day instead of 1.
+          SEARCH_QUERIES: "artificial intelligence explained,AI tools 2026,machine learning breakthrough,tech news AI,large language models,AI agents,future of technology,AI startup,AI coding assistant,robotics and AI,AI research paper explained,generative AI"
+          DAYS_BACK: "60"
+          MAX_CANDIDATES: "15"
+          MIN_CLIP_SECONDS: "45"
+          MAX_CLIP_SECONDS: "59"
+          CROP_MODE: "blur"
+          UPLOAD_PRIVACY: ${{ github.event.inputs.privacy || 'private' }}
+          GEMINI_MODEL: "gemini-2.0-flash"
+          POST_SLOT: ${{ steps.clock.outputs.slot }}
+          LOG_LEVEL: "INFO"
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            python main.py --dry-run
+          else
+            python main.py
+          fi
+
+      # ---------------------------------------------------------------
+      # 3. Keep the finished clip for 7 days so you can review it.
+      # ---------------------------------------------------------------
+      - name: Upload rendered clip as an artifact
+        if: steps.clock.outputs.run == 'true' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: short-${{ steps.clock.outputs.slot }}-run${{ github.run_number }}
+          path: output/*.mp4
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # ---------------------------------------------------------------
+      # 4. Remember which source videos we already used.
+      # ---------------------------------------------------------------
+      - name: Commit the processed-videos list
+        if: steps.clock.outputs.run == 'true' && always()
+        run: |
+          if [ -f state/processed.json ]; then
+            git config user.name  "shorts-factory-bot"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add state/processed.json
+            if git diff --staged --quiet; then
+              echo "No state change to commit."
+            else
+              git commit -m "chore: update processed videos (${{ steps.clock.outputs.slot }}) [skip ci]"
+              git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+              git push origin "HEAD:${GITHUB_REF_NAME}"
+            fi
+          fi
