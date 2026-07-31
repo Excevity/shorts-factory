@@ -447,22 +447,37 @@ class TranscriptCue:
 
 
 class TranscriptFetcher:
-    """Wraps youtube-transcript-api, tolerating both the 0.x and 1.x APIs."""
+    """
+    Gets the caption track for a video.
 
-    def __init__(self, cfg: Config) -> None:
+    Two independent routes, tried in order:
+      1. youtube-transcript-api  - fast, but YouTube often blocks it outright
+                                   from datacenter IPs like GitHub's runners.
+      2. yt-dlp                  - slower, but far more resistant to blocking
+                                   and it can use the same cookies/proxy that
+                                   the downloader uses.
+
+    Route 2 is why a run can still succeed when route 1 is being IP-blocked.
+    """
+
+    LANGS = ("en", "en-US", "en-GB", "en-orig", "a.en")
+
+    def __init__(self, cfg: Config, cookie_file: Path | None = None) -> None:
         self.cfg = cfg
+        self.cookie_file = cookie_file
+        self.last_reason: str = ""
 
     def fetch(self, video_id: str) -> list[TranscriptCue]:
-        try:
-            from youtube_transcript_api import YouTubeTranscriptApi  # type: ignore
-        except ImportError as exc:  # pragma: no cover
-            raise TranscriptError("youtube-transcript-api is not installed.") from exc
+        reasons: list[str] = []
 
-        raw = self._fetch_v1(YouTubeTranscriptApi, video_id)
-        if raw is None:
-            raw = self._fetch_v0(YouTubeTranscriptApi, video_id)
+        raw = self._fetch_via_api(video_id, reasons)
         if not raw:
-            raise TranscriptError(f"No transcript available for {video_id}.")
+            log.info("Falling back to yt-dlp for the transcript of %s ...", video_id)
+            raw = self._fetch_via_ytdlp(video_id, reasons)
+
+        if not raw:
+            self.last_reason = " | ".join(reasons) or "unknown"
+            raise TranscriptError(f"No transcript for {video_id} ({self.last_reason})")
 
         cues: list[TranscriptCue] = []
         for entry in raw:
@@ -487,7 +502,7 @@ class TranscriptFetcher:
                  video_id, len(cues), cues[-1].end / 60)
         return cues
 
-    # -- version shims ------------------------------------------------------
+    # -- route 1: youtube-transcript-api -----------------------------------
 
     def _proxy_config(self):
         if not self.cfg.proxy_url:
@@ -501,7 +516,19 @@ class TranscriptFetcher:
         except ImportError:
             return None
 
-    def _fetch_v1(self, api_cls, video_id: str):
+    def _fetch_via_api(self, video_id: str, reasons: list[str]):
+        try:
+            from youtube_transcript_api import YouTubeTranscriptApi  # type: ignore
+        except ImportError:
+            reasons.append("api:not-installed")
+            return None
+
+        raw = self._fetch_v1(YouTubeTranscriptApi, video_id, reasons)
+        if raw is None:
+            raw = self._fetch_v0(YouTubeTranscriptApi, video_id, reasons)
+        return raw
+
+    def _fetch_v1(self, api_cls, video_id: str, reasons: list[str]):
         if not hasattr(api_cls, "list") and not hasattr(api_cls, "fetch"):
             return None
         try:
@@ -510,26 +537,151 @@ class TranscriptFetcher:
             if proxy_cfg is not None:
                 kwargs["proxy_config"] = proxy_cfg
             instance = api_cls(**kwargs)
-            fetched = instance.fetch(video_id, languages=["en", "en-US", "en-GB"])
-            return list(fetched)
+            return list(instance.fetch(video_id, languages=list(self.LANGS)))
         except TypeError:
             return None
         except Exception as exc:
-            log.warning("Transcript v1 API failed for %s: %s", video_id, exc)
+            reasons.append(f"api:{type(exc).__name__}")
+            log.warning("Transcript API failed for %s: %s: %s",
+                        video_id, type(exc).__name__, str(exc)[:200])
             return None
 
-    def _fetch_v0(self, api_cls, video_id: str):
+    def _fetch_v0(self, api_cls, video_id: str, reasons: list[str]):
         getter = getattr(api_cls, "get_transcript", None)
         if getter is None:
             return None
         try:
-            kwargs: dict[str, Any] = {"languages": ["en", "en-US", "en-GB"]}
+            kwargs: dict[str, Any] = {"languages": list(self.LANGS)}
             if self.cfg.proxies:
                 kwargs["proxies"] = self.cfg.proxies
             return getter(video_id, **kwargs)
         except Exception as exc:
-            log.warning("Transcript v0 API failed for %s: %s", video_id, exc)
+            reasons.append(f"api0:{type(exc).__name__}")
             return None
+
+    # -- route 2: yt-dlp ----------------------------------------------------
+
+    def _fetch_via_ytdlp(self, video_id: str, reasons: list[str]):
+        """Ask yt-dlp for the caption track URL, then parse it ourselves."""
+        try:
+            import yt_dlp  # type: ignore
+        except ImportError:
+            reasons.append("ytdlp:not-installed")
+            return None
+
+        opts: dict[str, Any] = {
+            "skip_download": True,
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "socket_timeout": 45,
+            "retries": 3,
+            "geo_bypass": True,
+            "extractor_args": {"youtube": {"player_client": ["web_safari", "web"]}},
+        }
+        if self.cookie_file:
+            opts["cookiefile"] = str(self.cookie_file)
+        if self.cfg.proxy_url:
+            opts["proxy"] = self.cfg.proxy_url
+
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(
+                    f"https://www.youtube.com/watch?v={video_id}", download=False
+                )
+        except Exception as exc:
+            reasons.append(f"ytdlp:{type(exc).__name__}")
+            log.warning("yt-dlp could not read %s: %s", video_id, str(exc)[:200])
+            return None
+
+        track = self._pick_track(info or {})
+        if not track:
+            reasons.append("ytdlp:no-captions")
+            return None
+
+        try:
+            resp = requests.get(track["url"], timeout=60, proxies=self.cfg.proxies)
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            reasons.append(f"ytdlp-fetch:{type(exc).__name__}")
+            return None
+
+        ext = track.get("ext", "")
+        if ext == "json3":
+            return self._parse_json3(resp.text)
+        if ext in ("vtt", "srt"):
+            return self._parse_vtt(resp.text)
+        reasons.append(f"ytdlp:unsupported-format:{ext}")
+        return None
+
+    def _pick_track(self, info: dict[str, Any]) -> dict[str, Any] | None:
+        """Prefer real subtitles over auto-generated, and json3 over vtt."""
+        for source in ("subtitles", "automatic_captions"):
+            available = info.get(source) or {}
+            for lang in self.LANGS:
+                tracks = available.get(lang)
+                if not tracks:
+                    continue
+                for want in ("json3", "vtt", "srt"):
+                    for track in tracks:
+                        if track.get("ext") == want and track.get("url"):
+                            log.info("Using %s captions (%s/%s).", source, lang, want)
+                            return track
+        return None
+
+    @staticmethod
+    def _parse_json3(body: str) -> list[dict[str, Any]]:
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            return []
+        out = []
+        for event in data.get("events") or []:
+            start = event.get("tStartMs")
+            if start is None:
+                continue
+            text = "".join(seg.get("utf8", "") for seg in event.get("segs") or [])
+            if not text.strip():
+                continue
+            out.append({
+                "start": start / 1000.0,
+                "duration": (event.get("dDurationMs") or 0) / 1000.0,
+                "text": text,
+            })
+        return out
+
+    @staticmethod
+    def _parse_vtt(body: str) -> list[dict[str, Any]]:
+        def to_seconds(stamp: str) -> float:
+            stamp = stamp.replace(",", ".")
+            bits = [float(b) for b in stamp.split(":")]
+            while len(bits) < 3:
+                bits.insert(0, 0.0)
+            return bits[0] * 3600 + bits[1] * 60 + bits[2]
+
+        out: list[dict[str, Any]] = []
+        pattern = re.compile(
+            r"(\d{1,2}:\d{2}:\d{2}[.,]\d{3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[.,]\d{3})"
+        )
+        blocks = re.split(r"\n\s*\n", body)
+        for block in blocks:
+            match = pattern.search(block)
+            if not match:
+                continue
+            start, end = to_seconds(match.group(1)), to_seconds(match.group(2))
+            lines = block.split("\n")[match.string[: match.start()].count("\n") + 1 :]
+            text = " ".join(lines)
+            text = re.sub(r"<[^>]+>", "", text).strip()
+            if text:
+                out.append({"start": start, "duration": max(0.0, end - start), "text": text})
+
+        # Auto-captions repeat each line as a rolling window - drop the dupes.
+        deduped: list[dict[str, Any]] = []
+        for cue in out:
+            if deduped and cue["text"] == deduped[-1]["text"]:
+                continue
+            deduped.append(cue)
+        return deduped
 
 
 def cues_to_timestamped_text(cues: Iterable[TranscriptCue], max_chars: int = 45_000) -> str:
@@ -771,20 +923,27 @@ class GeminiPlanner:
 # ---------------------------------------------------------------------------
 
 
+def write_cookie_file(cfg: Config, workdir: Path) -> Path | None:
+    """Turn the YT_COOKIES secret into a file yt-dlp can read. Shared by the
+    transcript fetcher and the downloader so both get the same session."""
+    if not cfg.yt_cookies:
+        return None
+    path = workdir / "cookies.txt"
+    # GitHub Secrets sometimes collapse literal \n - repair them.
+    content = cfg.yt_cookies.replace("\\n", "\n")
+    if not content.endswith("\n"):
+        content += "\n"
+    path.write_text(content, encoding="utf-8")
+    os.chmod(path, 0o600)
+    log.info("Using supplied YouTube cookies.")
+    return path
+
+
 class SegmentDownloader:
-    def __init__(self, cfg: Config, workdir: Path) -> None:
+    def __init__(self, cfg: Config, workdir: Path, cookie_file: Path | None = None) -> None:
         self.cfg = cfg
         self.workdir = workdir
-        self.cookie_file: Path | None = None
-        if cfg.yt_cookies:
-            self.cookie_file = workdir / "cookies.txt"
-            # GitHub Secrets sometimes collapse literal \n - repair them.
-            content = cfg.yt_cookies.replace("\\n", "\n")
-            if not content.endswith("\n"):
-                content += "\n"
-            self.cookie_file.write_text(content, encoding="utf-8")
-            os.chmod(self.cookie_file, 0o600)
-            log.info("Using supplied YouTube cookies for yt-dlp.")
+        self.cookie_file = cookie_file
 
     def download(self, cand: Candidate, plan: ClipPlan) -> Path:
         try:
@@ -1055,10 +1214,11 @@ class YouTubeUploader:
 
 def build_clip(cfg: Config, workdir: Path, state: State) -> tuple[Path, ClipPlan, Candidate]:
     """Walk candidates until one of them yields a finished vertical clip."""
+    cookie_file = write_cookie_file(cfg, workdir)
     source = YouTubeSource(cfg)
-    transcripts = TranscriptFetcher(cfg)
+    transcripts = TranscriptFetcher(cfg, cookie_file)
     planner = GeminiPlanner(cfg)
-    downloader = SegmentDownloader(cfg, workdir)
+    downloader = SegmentDownloader(cfg, workdir, cookie_file)
     renderer = VerticalRenderer(cfg)
 
     candidates = source.find_candidates()
@@ -1070,6 +1230,7 @@ def build_clip(cfg: Config, workdir: Path, state: State) -> tuple[Path, ClipPlan
         )
 
     last_error: Exception | None = None
+    tally: dict[str, int] = {}
     for index, cand in enumerate(fresh, start=1):
         log.info("-" * 70)
         log.info("Candidate %d/%d: %s - %s (%s, %s views)",
@@ -1084,15 +1245,38 @@ def build_clip(cfg: Config, workdir: Path, state: State) -> tuple[Path, ClipPlan
             state.mark(cand.video_id)
             return final, plan, cand
         except (TranscriptError, GeminiError, DownloadError, RenderError) as exc:
-            log.warning("Candidate %s skipped: %s", cand.video_id, exc)
+            label = type(exc).__name__.replace("Error", "").lower()
+            tally[label] = tally.get(label, 0) + 1
+            log.warning("Candidate %s skipped (%s): %s", cand.video_id, label, exc)
             last_error = exc
-            state.mark(cand.video_id)  # do not retry a broken source tomorrow
+
+            # Only blacklist a video when the problem is permanent (it genuinely
+            # has no captions). A network block or rate limit is temporary, and
+            # blacklisting on those would silently burn the whole candidate pool
+            # during an outage.
+            permanent = True
+            if isinstance(exc, TranscriptError):
+                permanent = "no-captions" in transcripts.last_reason
+            if permanent:
+                state.mark(cand.video_id)
+            else:
+                log.info("Not blacklisting %s - looks like a temporary block.",
+                         cand.video_id)
+
             for leftover in workdir.glob("raw.*"):
                 leftover.unlink(missing_ok=True)
             continue
 
+    breakdown = ", ".join(f"{n}x {k}" for k, n in sorted(tally.items()))
+    hint = ""
+    if tally.get("transcript", 0) >= max(3, len(fresh) // 2):
+        hint = (
+            " Most failures were transcript fetches, which usually means YouTube is "
+            "blocking this datacenter IP. Adding the YT_COOKIES secret normally fixes it "
+            "- see the README."
+        )
     raise NoCandidateError(
-        f"All {len(fresh)} candidates failed. Last error: {last_error}"
+        f"All {len(fresh)} candidates failed ({breakdown}). Last error: {last_error}.{hint}"
     )
 
 
