@@ -528,15 +528,54 @@ class TranscriptFetcher:
             raw = self._fetch_v0(YouTubeTranscriptApi, video_id, reasons)
         return raw
 
+    def _cookie_session(self) -> "requests.Session | None":
+        """A requests session carrying our cookies and a browser User-Agent.
+
+        Without this, youtube-transcript-api sends bare python-requests headers
+        and ignores YT_COOKIES entirely - which datacenter IPs get blocked for
+        almost immediately.
+        """
+        if not self.cookie_file:
+            return None
+        try:
+            import http.cookiejar
+
+            jar = http.cookiejar.MozillaCookieJar(str(self.cookie_file))
+            jar.load(ignore_discard=True, ignore_expires=True)
+            session = requests.Session()
+            session.cookies = jar  # type: ignore[assignment]
+            session.headers.update({
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                ),
+                "Accept-Language": "en-US,en;q=0.9",
+            })
+            if self.cfg.proxies:
+                session.proxies.update(self.cfg.proxies)
+            log.info("Transcript requests will use your cookies + a browser User-Agent.")
+            return session
+        except Exception as exc:
+            log.warning("Could not build a cookie session: %s", exc)
+            return None
+
     def _fetch_v1(self, api_cls, video_id: str, reasons: list[str]):
         if not hasattr(api_cls, "list") and not hasattr(api_cls, "fetch"):
             return None
         try:
-            kwargs = {}
+            kwargs: dict[str, Any] = {}
             proxy_cfg = self._proxy_config()
             if proxy_cfg is not None:
                 kwargs["proxy_config"] = proxy_cfg
-            instance = api_cls(**kwargs)
+            session = self._cookie_session()
+            if session is not None:
+                kwargs["http_client"] = session
+            try:
+                instance = api_cls(**kwargs)
+            except TypeError:
+                # Older/newer versions may not accept http_client - drop it.
+                kwargs.pop("http_client", None)
+                instance = api_cls(**kwargs)
             return list(instance.fetch(video_id, languages=list(self.LANGS)))
         except TypeError:
             return None
