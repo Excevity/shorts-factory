@@ -269,6 +269,7 @@ class State:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.processed: set[str] = set()
+        self.slots: set[str] = set()      # e.g. "2026-07-31:10am"
         self._load()
 
     def _load(self) -> None:
@@ -277,8 +278,9 @@ class State:
                 raw = json.loads(self.path.read_text(encoding="utf-8"))
                 self.processed = set(raw.get("processed_story_ids", [])
                                      or raw.get("processed_video_ids", []))
-                log.info("Loaded state: %d story/stories already covered.",
-                         len(self.processed))
+                self.slots = set(raw.get("completed_slots", []))
+                log.info("Loaded state: %d story/stories covered, %d slot(s) logged.",
+                         len(self.processed), len(self.slots))
         except (OSError, json.JSONDecodeError) as exc:
             log.warning("Could not read state file (%s) - starting fresh.", exc)
 
@@ -288,12 +290,19 @@ class State:
     def mark(self, key: str) -> None:
         self.processed.add(key)
 
+    def slot_done(self, slot_key: str) -> bool:
+        return slot_key in self.slots
+
+    def mark_slot(self, slot_key: str) -> None:
+        self.slots.add(slot_key)
+
     def save(self) -> None:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text(json.dumps({
                 "updated_at": datetime.now(timezone.utc).isoformat(),
                 "processed_story_ids": sorted(self.processed)[-800:],
+                "completed_slots": sorted(self.slots)[-40:],
             }, indent=2), encoding="utf-8")
             log.info("State saved to %s", self.path)
         except OSError as exc:
@@ -1325,6 +1334,24 @@ def main() -> int:
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     state = State(cfg.state_file)
+
+    # Each posting slot is attempted more than once, because GitHub's free
+    # scheduler frequently delays or silently drops runs. This makes the extra
+    # attempts harmless: if the slot already produced a video today, stop here.
+    slot_key = ""
+    if slot != "manual":
+        try:
+            from zoneinfo import ZoneInfo
+
+            today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+        except Exception:
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        slot_key = f"{today}:{slot}"
+        if state.slot_done(slot_key):
+            log.info("The %s slot already posted today - nothing to do.", slot)
+            write_summary({"slot": slot, "result": "already posted today",
+                           "detail": "This is a backup attempt; the slot succeeded earlier."})
+            return 0
     workdir = Path(tempfile.mkdtemp(prefix="shorts_"))
     log.info("Working directory: %s", workdir)
 
@@ -1340,6 +1367,8 @@ def main() -> int:
         else:
             try:
                 video_id = YouTubeUploader(cfg).upload(video, script, story)
+                if slot_key:
+                    state.mark_slot(slot_key)
                 write_summary({
                     "slot": slot,
                     "story": f"{story.title} ({story.source})",
