@@ -1,0 +1,18 @@
+# Faceless Shorts Factory - Python dependencies
+# Everything here is free and installs on a GitHub Actions ubuntu-latest runner.
+
+# HTTP client (used for the YouTube search and Gemini REST APIs)
+requests>=2.32.0,<3.0.0
+
+# Downloads only the timestamped segment of the source video.
+# Pinned loosely on purpose: YouTube changes often, and yt-dlp ships fixes fast.
+yt-dlp>=2025.1.15
+
+# Pulls the caption track for the source video.
+youtube-transcript-api>=1.0.0,<2.0.0
+
+# Google auth + YouTube Data API v3 client (search and resumable upload)
+google-api-python-client>=2.140.0,<3.0.0
+google-auth>=2.35.0,<3.0.0
+google-auth-oauthlib>=1.2.0,<2.0.0
+google-auth-httplib2>=0.2.0,<1.0.0
