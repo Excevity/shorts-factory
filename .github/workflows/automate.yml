@@ -77,7 +77,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Verify FFmpeg is available
+      - name: Verify FFmpeg and caption fonts
         if: steps.clock.outputs.run == 'true'
         run: |
           if ! command -v ffmpeg >/dev/null 2>&1; then
@@ -85,8 +85,16 @@ jobs:
             sudo apt-get update -qq
             sudo apt-get install -y -qq ffmpeg
           fi
+          # Burned-in captions need a real font installed, not just FFmpeg.
+          if ! fc-list 2>/dev/null | grep -qi "DejaVu Sans"; then
+            echo "DejaVu font missing - installing it."
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq fonts-dejavu-core fontconfig
+          fi
           ffmpeg -version | head -n 1
-          ffprobe -version | head -n 1
+          ffmpeg -hide_banner -filters | grep -q " subtitles " \
+            && echo "subtitles filter: OK" \
+            || echo "WARNING: FFmpeg has no subtitles filter - captions will be skipped"
 
       # ---------------------------------------------------------------
       # 1. Make sure we have the newest 'already used' list.
@@ -103,24 +111,22 @@ jobs:
         if: steps.clock.outputs.run == 'true'
         env:
           # --- required secrets -------------------------------------
-          YOUTUBE_API_KEY:     ${{ secrets.YOUTUBE_API_KEY }}
           GEMINI_API_KEY:      ${{ secrets.GEMINI_API_KEY }}
           YT_CLIENT_ID:        ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET:    ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN:    ${{ secrets.YT_REFRESH_TOKEN }}
-          # --- optional secrets (leave unset and they are skipped) ---
-          YT_COOKIES:          ${{ secrets.YT_COOKIES }}
-          PROXY_URL:           ${{ secrets.PROXY_URL }}
+          # --- optional: free key from pexels.com for real stock footage.
+          #     Without it you still get a clean animated gradient background.
+          PEXELS_API_KEY:      ${{ secrets.PEXELS_API_KEY }}
           # --- tuning knobs (edit these freely, they are not secret) --
-          # More queries + more candidates, because we now burn 3 source
-          # videos every day instead of 1.
-          # Gaming first (bigger Creative Commons pool), then tech/AI.
-          SEARCH_QUERIES: "new game release review,most hyped games 2026,upcoming games 2026,game review,gameplay walkthrough,gaming news,indie game review,game first impressions,game trailer reaction,best games 2026,game development,speedrun,esports highlights,artificial intelligence explained,AI tools 2026,tech news AI,large language models,AI agents,generative AI"
-          DAYS_BACK: "90"
-          MAX_CANDIDATES: "25"
-          MIN_CLIP_SECONDS: "45"
-          MAX_CLIP_SECONDS: "59"
-          CROP_MODE: "blur"
+          # Where stories come from. Change these to change your niche.
+          RSS_FEEDS: "https://feeds.ign.com/ign/games-all,https://www.pcgamer.com/rss/,https://www.eurogamer.net/feed,https://www.rockpapershotgun.com/feed,https://www.gamespot.com/feeds/news/,https://www.polygon.com/rss/index.xml,https://www.nintendolife.com/feeds/latest,https://blog.playstation.com/feed/,https://techcrunch.com/category/artificial-intelligence/feed/,https://www.theverge.com/rss/index.xml,https://feeds.arstechnica.com/arstechnica/index"
+          HOURS_BACK: "48"
+          MAX_STORIES: "25"
+          TARGET_SECONDS: "50"
+          MAX_SECONDS: "59"
+          TTS_VOICE: "en-US-AndrewNeural"
+          TTS_RATE: "+8%"
           UPLOAD_PRIVACY: ${{ github.event.inputs.privacy || 'private' }}
           GEMINI_MODEL: "gemini-2.0-flash"
           POST_SLOT: ${{ steps.clock.outputs.slot }}
