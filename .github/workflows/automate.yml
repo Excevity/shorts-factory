@@ -135,7 +135,8 @@ jobs:
           TTS_RATE: "+8%"
           UPLOAD_PRIVACY: ${{ github.event.inputs.privacy || 'private' }}
           # Tried in order. If one is rate limited or retired, the next is used.
-          GEMINI_MODELS: "gemini-2.5-flash,gemini-2.0-flash,gemini-2.5-flash-lite"
+          # If they all fail, the log prints exactly which models your key can use.
+          GEMINI_MODELS: "gemini-2.0-flash,gemini-flash-latest,gemini-2.0-flash-lite,gemini-2.5-flash,gemini-2.5-flash-lite"
           POST_SLOT: ${{ steps.clock.outputs.slot }}
           LOG_LEVEL: "INFO"
         run: |
