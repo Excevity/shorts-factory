@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
 """
-Faceless Shorts Factory
-=======================
+Faceless Shorts Factory  -  original content edition
+====================================================
 
-A zero-cost, fully automated pipeline designed to run inside GitHub Actions.
+A zero-cost, fully automated YouTube Shorts pipeline for GitHub Actions.
+
+Nothing is scraped from YouTube, so there is nothing for Google to IP-block.
+Every Short is original: our script, our narration, licensed stock footage.
 
 Pipeline
 --------
-1. SOURCE   : YouTube Data API v3 search for recent Creative Commons (CC-BY)
-              long-form videos in the Tech / AI niche.
-2. LOGIC    : Pull the transcript, hand it to Google Gemini (free tier), ask it
-              to pick the single most viral continuous 45-60 second segment.
-3. PROCESS  : yt-dlp downloads ONLY that timestamped segment, then FFmpeg
-              reframes it to a 1080x1920 (9:16) vertical video.
-4. DISTRIBUTE: Upload to YouTube as a Short (Data API v3, resumable upload).
+1. SOURCE   : Read gaming / tech RSS feeds for today's stories. Feeds are
+              designed for machines, so datacenter IPs are welcome.
+2. SCRIPT   : Google Gemini (free tier) turns one story into a tight 45-55
+              second narration plus title, description, hashtags and a list
+              of b-roll search terms.
+3. VOICE    : Microsoft Edge's online TTS reads the script. Free, no API key.
+              It also returns word-level timings, which we turn into captions
+              WITHOUT needing any speech recognition.
+4. FOOTAGE  : Pexels (free API) supplies vertical stock clips matching the
+              b-roll terms. If no key is set, we generate an animated
+              gradient background instead so the run still works.
+5. ASSEMBLE : FFmpeg builds 1080x1920, burns in the captions, muxes audio.
+6. UPLOAD   : YouTube Data API v3 resumable upload.
 
-Everything is driven by environment variables so that secrets never touch disk.
 Run locally for testing with:  python main.py --dry-run
 
 Author: generated for Ege
@@ -25,6 +33,9 @@ License: MIT
 from __future__ import annotations
 
 import argparse
+import asyncio
+import hashlib
+import html
 import json
 import logging
 import os
@@ -34,6 +45,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -61,40 +73,56 @@ log = logging.getLogger("shorts-factory")
 
 
 class PipelineError(RuntimeError):
-    """Base class for every failure this pipeline can raise on purpose."""
+    """Base class for every failure this pipeline raises on purpose."""
 
 
 class ConfigError(PipelineError):
     """A required secret / environment variable is missing or malformed."""
 
 
-class NoCandidateError(PipelineError):
-    """Nothing usable was found this run. Not a crash - just an empty day."""
+class NoStoryError(PipelineError):
+    """Nothing fresh to talk about. Not a crash - just a quiet day."""
 
 
-class TranscriptError(PipelineError):
-    """The transcript could not be fetched for a given video."""
+class ScriptError(PipelineError):
+    """Gemini refused, rate-limited, or returned something unusable."""
 
 
-class GeminiError(PipelineError):
-    """Gemini refused, rate-limited, or returned something unparseable."""
+class NarrationError(PipelineError):
+    """Text-to-speech failed."""
 
 
-class DownloadError(PipelineError):
-    """yt-dlp could not fetch the requested segment."""
+class FootageError(PipelineError):
+    """Could not obtain any usable background footage."""
 
 
 class RenderError(PipelineError):
-    """FFmpeg failed to produce a valid vertical clip."""
+    """FFmpeg failed to produce a valid video."""
 
 
 class UploadError(PipelineError):
-    """A distribution target rejected the upload."""
+    """YouTube rejected the upload."""
 
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+
+DEFAULT_FEEDS = ",".join([
+    # --- gaming -----------------------------------------------------------
+    "https://feeds.ign.com/ign/games-all",
+    "https://www.pcgamer.com/rss/",
+    "https://www.eurogamer.net/feed",
+    "https://www.rockpapershotgun.com/feed",
+    "https://www.gamespot.com/feeds/news/",
+    "https://www.polygon.com/rss/index.xml",
+    "https://www.nintendolife.com/feeds/latest",
+    "https://blog.playstation.com/feed/",
+    # --- tech / AI --------------------------------------------------------
+    "https://techcrunch.com/category/artificial-intelligence/feed/",
+    "https://www.theverge.com/rss/index.xml",
+    "https://feeds.arstechnica.com/arstechnica/index",
+])
 
 
 def _env(name: str, default: str | None = None, required: bool = False) -> str | None:
@@ -104,7 +132,7 @@ def _env(name: str, default: str | None = None, required: bool = False) -> str |
     if required and not value:
         raise ConfigError(
             f"Missing required environment variable/secret: {name}. "
-            f"Add it under Settings -> Secrets and variables -> Actions."
+            "Add it under Settings -> Secrets and variables -> Actions."
         )
     return value or None
 
@@ -112,24 +140,22 @@ def _env(name: str, default: str | None = None, required: bool = False) -> str |
 @dataclass
 class Config:
     # --- credentials -------------------------------------------------------
-    youtube_api_key: str
     gemini_api_key: str
     yt_client_id: str
     yt_client_secret: str
     yt_refresh_token: str
-
-    # --- anti-bot helpers (optional) --------------------------------------
-    yt_cookies: str | None = None          # raw Netscape cookies.txt contents
-    proxy_url: str | None = None           # e.g. http://user:pass@host:port
+    pexels_api_key: str | None = None       # optional - falls back to gradient
 
     # --- tuning ------------------------------------------------------------
-    search_queries: list[str] = field(default_factory=list)
-    days_back: int = 30
-    max_candidates: int = 12
-    min_clip_seconds: int = 45
-    max_clip_seconds: int = 59
-    crop_mode: str = "blur"                # "blur" | "center"
-    upload_privacy: str = "private"        # private | unlisted | public
+    feeds: list[str] = field(default_factory=list)
+    hours_back: int = 48
+    max_stories: int = 25
+    target_seconds: int = 50
+    max_seconds: int = 59
+    voice: str = "en-US-AndrewNeural"
+    fallback_voice: str = "en-US-GuyNeural"
+    speech_rate: str = "+8%"
+    upload_privacy: str = "private"
     gemini_model: str = "gemini-2.0-flash"
     state_file: Path = Path("state/processed.json")
     output_dir: Path = Path("output")
@@ -137,16 +163,10 @@ class Config:
 
     @classmethod
     def from_env(cls, dry_run: bool = False) -> "Config":
-        queries_raw = _env(
-            "SEARCH_QUERIES",
-            "artificial intelligence explained,AI tools 2026,machine learning breakthrough,"
-            "tech news AI,large language models,AI agents,future of technology",
-        )
-        queries = [q.strip() for q in (queries_raw or "").split(",") if q.strip()]
-
-        crop_mode = (_env("CROP_MODE", "blur") or "blur").lower()
-        if crop_mode not in {"blur", "center"}:
-            raise ConfigError("CROP_MODE must be either 'blur' or 'center'.")
+        feeds_raw = _env("RSS_FEEDS", DEFAULT_FEEDS) or DEFAULT_FEEDS
+        feeds = [f.strip() for f in feeds_raw.split(",") if f.strip().startswith("http")]
+        if not feeds:
+            raise ConfigError("RSS_FEEDS contained no valid http(s) URLs.")
 
         privacy = (_env("UPLOAD_PRIVACY", "private") or "private").lower()
         if privacy not in {"private", "unlisted", "public"}:
@@ -156,35 +176,29 @@ class Config:
             try:
                 return int(_env(name, str(default)) or default)
             except ValueError as exc:
-                raise ConfigError(f"{name} must be an integer.") from exc
+                raise ConfigError(f"{name} must be a whole number.") from exc
 
-        cfg = cls(
-            youtube_api_key=_env("YOUTUBE_API_KEY", required=not dry_run) or "",
+        return cls(
             gemini_api_key=_env("GEMINI_API_KEY", required=not dry_run) or "",
             yt_client_id=_env("YT_CLIENT_ID", required=not dry_run) or "",
             yt_client_secret=_env("YT_CLIENT_SECRET", required=not dry_run) or "",
             yt_refresh_token=_env("YT_REFRESH_TOKEN", required=not dry_run) or "",
-            yt_cookies=_env("YT_COOKIES"),
-            proxy_url=_env("PROXY_URL"),
-            search_queries=queries,
-            days_back=_int("DAYS_BACK", 30),
-            max_candidates=_int("MAX_CANDIDATES", 12),
-            min_clip_seconds=_int("MIN_CLIP_SECONDS", 45),
-            max_clip_seconds=_int("MAX_CLIP_SECONDS", 59),
-            crop_mode=crop_mode,
+            pexels_api_key=_env("PEXELS_API_KEY"),
+            feeds=feeds,
+            hours_back=_int("HOURS_BACK", 48),
+            max_stories=_int("MAX_STORIES", 25),
+            target_seconds=_int("TARGET_SECONDS", 50),
+            max_seconds=_int("MAX_SECONDS", 59),
+            voice=_env("TTS_VOICE", "en-US-AndrewNeural") or "en-US-AndrewNeural",
+            fallback_voice=_env("TTS_FALLBACK_VOICE", "en-US-GuyNeural") or "en-US-GuyNeural",
+            speech_rate=_env("TTS_RATE", "+8%") or "+8%",
             upload_privacy=privacy,
             gemini_model=_env("GEMINI_MODEL", "gemini-2.0-flash") or "gemini-2.0-flash",
-            state_file=Path(_env("STATE_FILE", "state/processed.json") or "state/processed.json"),
+            state_file=Path(_env("STATE_FILE", "state/processed.json")
+                            or "state/processed.json"),
             output_dir=Path(_env("OUTPUT_DIR", "output") or "output"),
             dry_run=dry_run,
         )
-        return cfg
-
-    @property
-    def proxies(self) -> dict[str, str] | None:
-        if not self.proxy_url:
-            return None
-        return {"http": self.proxy_url, "https": self.proxy_url}
 
 
 # ---------------------------------------------------------------------------
@@ -192,18 +206,13 @@ class Config:
 # ---------------------------------------------------------------------------
 
 
-def retry(
-    times: int = 3,
-    delay: float = 2.0,
-    backoff: float = 2.0,
-    exceptions: tuple[type[BaseException], ...] = (Exception,),
-):
+def retry(times: int = 3, delay: float = 2.0, backoff: float = 2.0,
+          exceptions: tuple[type[BaseException], ...] = (Exception,)):
     """Decorator: retry a flaky network call with exponential backoff."""
 
     def decorator(fn):
         def wrapper(*args, **kwargs):
-            wait = delay
-            last: BaseException | None = None
+            wait, last = delay, None
             for attempt in range(1, times + 1):
                 try:
                     return fn(*args, **kwargs)
@@ -211,12 +220,10 @@ def retry(
                     last = exc
                     if attempt == times:
                         break
-                    jitter = random.uniform(0, 1.0)
-                    log.warning(
-                        "%s failed (attempt %d/%d): %s - retrying in %.1fs",
-                        fn.__name__, attempt, times, exc, wait + jitter,
-                    )
-                    time.sleep(wait + jitter)
+                    pause = wait + random.uniform(0, 1.0)
+                    log.warning("%s failed (%d/%d): %s - retrying in %.1fs",
+                                fn.__name__, attempt, times, exc, pause)
+                    time.sleep(pause)
                     wait *= backoff
             raise last  # type: ignore[misc]
 
@@ -226,29 +233,23 @@ def retry(
     return decorator
 
 
-def hhmmss(seconds: float) -> str:
-    seconds = max(0, int(seconds))
-    return f"{seconds // 3600:02d}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}"
-
-
-def parse_iso8601_duration(value: str) -> int:
-    """Convert an ISO-8601 duration like 'PT1H2M10S' into seconds."""
-    match = re.fullmatch(
-        r"P(?:(\d+)D)?T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", value or ""
-    )
-    if not match:
-        return 0
-    days, hours, minutes, secs = (int(g) if g else 0 for g in match.groups())
-    return days * 86400 + hours * 3600 + minutes * 60 + secs
+def strip_html(raw: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", raw or "")
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def sanitize_filename(name: str, limit: int = 60) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._-")
-    return (cleaned or "clip")[:limit]
+    return (cleaned or "short")[:limit]
+
+
+def story_id(link: str) -> str:
+    return hashlib.sha1(link.encode("utf-8", "ignore")).hexdigest()[:16]
 
 
 # ---------------------------------------------------------------------------
-# State (so we never repost the same source video twice)
+# State - so the same story is never covered twice
 # ---------------------------------------------------------------------------
 
 
@@ -262,562 +263,224 @@ class State:
         try:
             if self.path.exists():
                 raw = json.loads(self.path.read_text(encoding="utf-8"))
-                self.processed = set(raw.get("processed_video_ids", []))
-                log.info("Loaded state: %d video(s) already processed.", len(self.processed))
+                self.processed = set(raw.get("processed_story_ids", [])
+                                     or raw.get("processed_video_ids", []))
+                log.info("Loaded state: %d story/stories already covered.",
+                         len(self.processed))
         except (OSError, json.JSONDecodeError) as exc:
             log.warning("Could not read state file (%s) - starting fresh.", exc)
-            self.processed = set()
 
-    def seen(self, video_id: str) -> bool:
-        return video_id in self.processed
+    def seen(self, key: str) -> bool:
+        return key in self.processed
 
-    def mark(self, video_id: str) -> None:
-        self.processed.add(video_id)
+    def mark(self, key: str) -> None:
+        self.processed.add(key)
 
     def save(self) -> None:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {
+            self.path.write_text(json.dumps({
                 "updated_at": datetime.now(timezone.utc).isoformat(),
-                # keep the file from growing forever
-                "processed_video_ids": sorted(self.processed)[-500:],
-            }
-            self.path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                "processed_story_ids": sorted(self.processed)[-800:],
+            }, indent=2), encoding="utf-8")
             log.info("State saved to %s", self.path)
         except OSError as exc:
             log.error("Failed to write state file: %s", exc)
 
 
 # ---------------------------------------------------------------------------
-# STEP 1 - Sourcing via the YouTube Data API v3
+# STEP 1 - Source stories from RSS
 # ---------------------------------------------------------------------------
 
 
 @dataclass
-class Candidate:
-    video_id: str
+class Story:
     title: str
-    channel: str
-    channel_id: str
-    published_at: str
-    duration_s: int = 0
-    view_count: int = 0
+    summary: str
+    link: str
+    source: str
+    published: datetime | None = None
 
     @property
-    def url(self) -> str:
-        return f"https://www.youtube.com/watch?v={self.video_id}"
+    def key(self) -> str:
+        return story_id(self.link)
 
     @property
-    def attribution(self) -> str:
-        return (
-            f'Source: "{self.title}" by {self.channel}\n'
-            f"{self.url}\n"
-            "Licensed under Creative Commons Attribution (CC BY 3.0)\n"
-            "https://creativecommons.org/licenses/by/3.0/"
-        )
+    def age_hours(self) -> float:
+        if not self.published:
+            return 999.0
+        return (datetime.now(timezone.utc) - self.published).total_seconds() / 3600
 
 
-class YouTubeSource:
-    SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
-    VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
+class NewsSource:
+    """Pulls candidate stories from RSS feeds.
+
+    RSS exists to be read by machines, so unlike scraping YouTube this works
+    perfectly well from a datacenter IP.
+    """
+
+    HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/rss+xml, application/xml, text/xml, */*",
+    }
 
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
-        self.session = requests.Session()
 
-    @retry(times=3, delay=3.0, exceptions=(requests.RequestException,))
-    def _get(self, url: str, params: dict[str, Any]) -> dict[str, Any]:
-        params = {**params, "key": self.cfg.youtube_api_key}
-        resp = self.session.get(url, params=params, timeout=30)
-        if resp.status_code == 403:
-            # Quota exhausted or key restricted - retrying will not help.
-            raise PipelineError(
-                f"YouTube API returned 403. Usually this means the daily quota is "
-                f"exhausted or the API key is restricted. Body: {resp.text[:400]}"
-            )
-        resp.raise_for_status()
-        return resp.json()
+    def collect(self) -> list[Story]:
+        try:
+            import feedparser  # type: ignore
+        except ImportError as exc:  # pragma: no cover
+            raise ConfigError("feedparser is not installed.") from exc
 
-    def find_candidates(self) -> list[Candidate]:
-        """Search several queries, then enrich with duration + view count."""
-        published_after = (
-            datetime.now(timezone.utc) - timedelta(days=self.cfg.days_back)
-        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        stories: dict[str, Story] = {}
+        feeds = list(self.cfg.feeds)
+        random.shuffle(feeds)
 
-        found: dict[str, Candidate] = {}
-        queries = list(self.cfg.search_queries)
-        random.shuffle(queries)
-
-        for query in queries:
-            if len(found) >= self.cfg.max_candidates:
-                break
-            log.info("Searching YouTube for CC-BY videos: %r", query)
+        for url in feeds:
             try:
-                data = self._get(
-                    self.SEARCH_URL,
-                    {
-                        "part": "snippet",
-                        "q": query,
-                        "type": "video",
-                        "videoLicense": "creativeCommon",   # <- the CC-BY filter
-                        "videoDuration": "medium",          # 4-20 minutes
-                        "videoEmbeddable": "true",
-                        "relevanceLanguage": "en",
-                        "order": "viewCount",
-                        "publishedAfter": published_after,
-                        "maxResults": 10,
-                    },
-                )
-            except PipelineError:
-                raise
-            except Exception as exc:  # network gave up after retries
-                log.warning("Search failed for %r: %s", query, exc)
-                continue
-
-            for item in data.get("items", []):
-                vid = (item.get("id") or {}).get("videoId")
-                snip = item.get("snippet") or {}
-                if not vid or vid in found:
-                    continue
-                found[vid] = Candidate(
-                    video_id=vid,
-                    title=snip.get("title", "Untitled"),
-                    channel=snip.get("channelTitle", "Unknown channel"),
-                    channel_id=snip.get("channelId", ""),
-                    published_at=snip.get("publishedAt", ""),
-                )
-
-        if not found:
-            raise NoCandidateError(
-                "YouTube search returned no Creative Commons videos for any query. "
-                "Try widening SEARCH_QUERIES or increasing DAYS_BACK."
-            )
-
-        self._enrich(found)
-        ranked = sorted(found.values(), key=lambda c: c.view_count, reverse=True)
-        log.info("Found %d candidate source video(s).", len(ranked))
-        return ranked[: self.cfg.max_candidates]
-
-    def _enrich(self, found: dict[str, Candidate]) -> None:
-        """Second API call: real duration + view count + license confirmation."""
-        ids = list(found.keys())
-        for i in range(0, len(ids), 50):
-            chunk = ids[i : i + 50]
-            try:
-                data = self._get(
-                    self.VIDEOS_URL,
-                    {"part": "contentDetails,statistics,status", "id": ",".join(chunk)},
-                )
+                resp = requests.get(url, headers=self.HEADERS, timeout=25)
+                resp.raise_for_status()
+                parsed = feedparser.parse(resp.content)
             except Exception as exc:
-                log.warning("Could not enrich video metadata: %s", exc)
+                log.warning("Feed failed (%s): %s", url, str(exc)[:120])
                 continue
 
-            for item in data.get("items", []):
-                cand = found.get(item.get("id", ""))
-                if not cand:
-                    continue
-                details = item.get("contentDetails") or {}
-                stats = item.get("statistics") or {}
-                status = item.get("status") or {}
-                cand.duration_s = parse_iso8601_duration(details.get("duration", ""))
-                try:
-                    cand.view_count = int(stats.get("viewCount", 0))
-                except (TypeError, ValueError):
-                    cand.view_count = 0
-                # Belt and braces: drop anything the API does not confirm as CC.
-                if status.get("license") and status["license"] != "creativeCommon":
-                    log.info("Dropping %s - license is %s", cand.video_id, status["license"])
-                    found.pop(cand.video_id, None)
+            entries = parsed.entries or []
+            log.info("%-52s %d entries", url.split("//")[-1][:52], len(entries))
+            source_name = strip_html(getattr(parsed.feed, "title", "")) or url
 
+            for entry in entries[:20]:
+                story = self._to_story(entry, source_name)
+                if story and story.key not in stories:
+                    stories[story.key] = story
 
-# ---------------------------------------------------------------------------
-# STEP 2a - Transcript extraction
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class TranscriptCue:
-    start: float
-    duration: float
-    text: str
-
-    @property
-    def end(self) -> float:
-        return self.start + self.duration
-
-
-class TranscriptFetcher:
-    """
-    Gets the caption track for a video.
-
-    Two independent routes, tried in order:
-      1. youtube-transcript-api  - fast, but YouTube often blocks it outright
-                                   from datacenter IPs like GitHub's runners.
-      2. yt-dlp                  - slower, but far more resistant to blocking
-                                   and it can use the same cookies/proxy that
-                                   the downloader uses.
-
-    Route 2 is why a run can still succeed when route 1 is being IP-blocked.
-    """
-
-    LANGS = ("en", "en-US", "en-GB", "en-orig", "a.en")
-
-    def __init__(self, cfg: Config, cookie_file: Path | None = None) -> None:
-        self.cfg = cfg
-        self.cookie_file = cookie_file
-        self.last_reason: str = ""
-
-    def fetch(self, video_id: str) -> list[TranscriptCue]:
-        reasons: list[str] = []
-
-        raw = self._fetch_via_api(video_id, reasons)
-        if not raw:
-            log.info("Falling back to yt-dlp for the transcript of %s ...", video_id)
-            raw = self._fetch_via_ytdlp(video_id, reasons)
-
-        if not raw:
-            self.last_reason = " | ".join(reasons) or "unknown"
-            raise TranscriptError(f"No transcript for {video_id} ({self.last_reason})")
-
-        cues: list[TranscriptCue] = []
-        for entry in raw:
-            if isinstance(entry, dict):
-                text, start, dur = entry.get("text"), entry.get("start"), entry.get("duration")
-            else:  # 1.x returns FetchedTranscriptSnippet objects
-                text = getattr(entry, "text", None)
-                start = getattr(entry, "start", None)
-                dur = getattr(entry, "duration", None)
-            if not text or start is None:
-                continue
-            cleaned = re.sub(r"\s+", " ", str(text).replace("\n", " ")).strip()
-            if not cleaned or cleaned.startswith("[") and cleaned.endswith("]"):
-                continue
-            cues.append(TranscriptCue(float(start), float(dur or 0), cleaned))
-
-        if len(cues) < 20:
-            raise TranscriptError(
-                f"Transcript for {video_id} is too short ({len(cues)} cues) to be useful."
+        if not stories:
+            raise NoStoryError(
+                "No RSS feed returned any usable entries. Check the RSS_FEEDS "
+                "setting - one or more URLs may have moved."
             )
-        log.info("Transcript OK for %s (%d cues, %.0f min).",
-                 video_id, len(cues), cues[-1].end / 60)
-        return cues
 
-    # -- route 1: youtube-transcript-api -----------------------------------
+        fresh = [s for s in stories.values() if s.age_hours <= self.cfg.hours_back]
+        if not fresh:  # feeds without dates, or a quiet news period
+            log.info("Nothing inside the %dh window - using everything found.",
+                     self.cfg.hours_back)
+            fresh = list(stories.values())
 
-    def _proxy_config(self):
-        if not self.cfg.proxy_url:
-            return None
-        try:
-            from youtube_transcript_api.proxies import GenericProxyConfig  # type: ignore
+        fresh.sort(key=lambda s: s.age_hours)
+        log.info("Collected %d story/stories (%d fresh).", len(stories), len(fresh))
+        return fresh[: self.cfg.max_stories]
 
-            return GenericProxyConfig(
-                http_url=self.cfg.proxy_url, https_url=self.cfg.proxy_url
-            )
-        except ImportError:
-            return None
-
-    def _fetch_via_api(self, video_id: str, reasons: list[str]):
-        try:
-            from youtube_transcript_api import YouTubeTranscriptApi  # type: ignore
-        except ImportError:
-            reasons.append("api:not-installed")
+    def _to_story(self, entry: Any, source_name: str) -> Story | None:
+        title = strip_html(getattr(entry, "title", ""))
+        link = (getattr(entry, "link", "") or "").strip()
+        if not title or not link or len(title) < 15:
             return None
 
-        raw = self._fetch_v1(YouTubeTranscriptApi, video_id, reasons)
-        if raw is None:
-            raw = self._fetch_v0(YouTubeTranscriptApi, video_id, reasons)
-        return raw
-
-    def _cookie_session(self) -> "requests.Session | None":
-        """A requests session carrying our cookies and a browser User-Agent.
-
-        Without this, youtube-transcript-api sends bare python-requests headers
-        and ignores YT_COOKIES entirely - which datacenter IPs get blocked for
-        almost immediately.
-        """
-        if not self.cookie_file:
-            return None
-        try:
-            import http.cookiejar
-
-            jar = http.cookiejar.MozillaCookieJar(str(self.cookie_file))
-            jar.load(ignore_discard=True, ignore_expires=True)
-            session = requests.Session()
-            session.cookies = jar  # type: ignore[assignment]
-            session.headers.update({
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-                ),
-                "Accept-Language": "en-US,en;q=0.9",
-            })
-            if self.cfg.proxies:
-                session.proxies.update(self.cfg.proxies)
-            log.info("Transcript requests will use your cookies + a browser User-Agent.")
-            return session
-        except Exception as exc:
-            log.warning("Could not build a cookie session: %s", exc)
-            return None
-
-    def _fetch_v1(self, api_cls, video_id: str, reasons: list[str]):
-        if not hasattr(api_cls, "list") and not hasattr(api_cls, "fetch"):
-            return None
-        try:
-            kwargs: dict[str, Any] = {}
-            proxy_cfg = self._proxy_config()
-            if proxy_cfg is not None:
-                kwargs["proxy_config"] = proxy_cfg
-            session = self._cookie_session()
-            if session is not None:
-                kwargs["http_client"] = session
-            try:
-                instance = api_cls(**kwargs)
-            except TypeError:
-                # Older/newer versions may not accept http_client - drop it.
-                kwargs.pop("http_client", None)
-                instance = api_cls(**kwargs)
-            return list(instance.fetch(video_id, languages=list(self.LANGS)))
-        except TypeError:
-            return None
-        except Exception as exc:
-            reasons.append(f"api:{type(exc).__name__}")
-            log.warning("Transcript API failed for %s: %s: %s",
-                        video_id, type(exc).__name__, str(exc)[:200])
-            return None
-
-    def _fetch_v0(self, api_cls, video_id: str, reasons: list[str]):
-        getter = getattr(api_cls, "get_transcript", None)
-        if getter is None:
-            return None
-        try:
-            kwargs: dict[str, Any] = {"languages": list(self.LANGS)}
-            if self.cfg.proxies:
-                kwargs["proxies"] = self.cfg.proxies
-            return getter(video_id, **kwargs)
-        except Exception as exc:
-            reasons.append(f"api0:{type(exc).__name__}")
-            return None
-
-    # -- route 2: yt-dlp ----------------------------------------------------
-
-    def _fetch_via_ytdlp(self, video_id: str, reasons: list[str]):
-        """Ask yt-dlp for the caption track URL, then parse it ourselves."""
-        try:
-            import yt_dlp  # type: ignore
-        except ImportError:
-            reasons.append("ytdlp:not-installed")
-            return None
-
-        opts: dict[str, Any] = {
-            "skip_download": True,
-            "quiet": True,
-            "no_warnings": True,
-            "noprogress": True,
-            "socket_timeout": 45,
-            "retries": 3,
-            "geo_bypass": True,
-            "extractor_args": {"youtube": {"player_client": ["web_safari", "web"]}},
-        }
-        if self.cookie_file:
-            opts["cookiefile"] = str(self.cookie_file)
-        if self.cfg.proxy_url:
-            opts["proxy"] = self.cfg.proxy_url
-
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(
-                    f"https://www.youtube.com/watch?v={video_id}", download=False
-                )
-        except Exception as exc:
-            reasons.append(f"ytdlp:{type(exc).__name__}")
-            log.warning("yt-dlp could not read %s: %s", video_id, str(exc)[:200])
-            return None
-
-        track = self._pick_track(info or {})
-        if not track:
-            reasons.append("ytdlp:no-captions")
-            return None
-
-        try:
-            resp = requests.get(track["url"], timeout=60, proxies=self.cfg.proxies)
-            resp.raise_for_status()
-        except requests.RequestException as exc:
-            reasons.append(f"ytdlp-fetch:{type(exc).__name__}")
-            return None
-
-        ext = track.get("ext", "")
-        if ext == "json3":
-            return self._parse_json3(resp.text)
-        if ext in ("vtt", "srt"):
-            return self._parse_vtt(resp.text)
-        reasons.append(f"ytdlp:unsupported-format:{ext}")
-        return None
-
-    def _pick_track(self, info: dict[str, Any]) -> dict[str, Any] | None:
-        """Prefer real subtitles over auto-generated, and json3 over vtt."""
-        for source in ("subtitles", "automatic_captions"):
-            available = info.get(source) or {}
-            for lang in self.LANGS:
-                tracks = available.get(lang)
-                if not tracks:
-                    continue
-                for want in ("json3", "vtt", "srt"):
-                    for track in tracks:
-                        if track.get("ext") == want and track.get("url"):
-                            log.info("Using %s captions (%s/%s).", source, lang, want)
-                            return track
-        return None
-
-    @staticmethod
-    def _parse_json3(body: str) -> list[dict[str, Any]]:
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError:
-            return []
-        out = []
-        for event in data.get("events") or []:
-            start = event.get("tStartMs")
-            if start is None:
-                continue
-            text = "".join(seg.get("utf8", "") for seg in event.get("segs") or [])
-            if not text.strip():
-                continue
-            out.append({
-                "start": start / 1000.0,
-                "duration": (event.get("dDurationMs") or 0) / 1000.0,
-                "text": text,
-            })
-        return out
-
-    @staticmethod
-    def _parse_vtt(body: str) -> list[dict[str, Any]]:
-        def to_seconds(stamp: str) -> float:
-            stamp = stamp.replace(",", ".")
-            bits = [float(b) for b in stamp.split(":")]
-            while len(bits) < 3:
-                bits.insert(0, 0.0)
-            return bits[0] * 3600 + bits[1] * 60 + bits[2]
-
-        out: list[dict[str, Any]] = []
-        pattern = re.compile(
-            r"(\d{1,2}:\d{2}:\d{2}[.,]\d{3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[.,]\d{3})"
+        summary = strip_html(
+            getattr(entry, "summary", "") or getattr(entry, "description", "")
         )
-        blocks = re.split(r"\n\s*\n", body)
-        for block in blocks:
-            match = pattern.search(block)
-            if not match:
-                continue
-            start, end = to_seconds(match.group(1)), to_seconds(match.group(2))
-            lines = block.split("\n")[match.string[: match.start()].count("\n") + 1 :]
-            text = " ".join(lines)
-            text = re.sub(r"<[^>]+>", "", text).strip()
-            if text:
-                out.append({"start": start, "duration": max(0.0, end - start), "text": text})
+        for content in getattr(entry, "content", []) or []:
+            value = strip_html(content.get("value", ""))
+            if len(value) > len(summary):
+                summary = value
 
-        # Auto-captions repeat each line as a rolling window - drop the dupes.
-        deduped: list[dict[str, Any]] = []
-        for cue in out:
-            if deduped and cue["text"] == deduped[-1]["text"]:
-                continue
-            deduped.append(cue)
-        return deduped
+        published = None
+        for attr in ("published_parsed", "updated_parsed"):
+            parsed_time = getattr(entry, attr, None)
+            if parsed_time:
+                try:
+                    published = datetime(*parsed_time[:6], tzinfo=timezone.utc)
+                    break
+                except (TypeError, ValueError):
+                    pass
 
-
-def cues_to_timestamped_text(cues: Iterable[TranscriptCue], max_chars: int = 45_000) -> str:
-    """Flatten cues into '[123.4s] text' lines that Gemini can reason about."""
-    lines: list[str] = []
-    total = 0
-    for cue in cues:
-        line = f"[{cue.start:.1f}] {cue.text}"
-        if total + len(line) > max_chars:
-            break
-        lines.append(line)
-        total += len(line) + 1
-    return "\n".join(lines)
+        return Story(title=title, summary=summary[:2500], link=link,
+                     source=source_name, published=published)
 
 
 # ---------------------------------------------------------------------------
-# STEP 2b - Gemini picks the viral segment
+# STEP 2 - Gemini writes the script
 # ---------------------------------------------------------------------------
 
 
 @dataclass
-class ClipPlan:
-    start: float
-    end: float
+class VideoScript:
+    narration: str
     title: str
     description: str
     hashtags: list[str]
-    reason: str = ""
+    broll: list[str]
 
     @property
-    def duration(self) -> float:
-        return self.end - self.start
+    def word_count(self) -> int:
+        return len(self.narration.split())
 
 
-PROMPT_TEMPLATE = """You are a world-class short-form video editor who has produced
-viral YouTube Shorts in the technology and AI niche.
+PROMPT = """You write viral short-form video scripts about {topic}.
 
-Below is the timestamped transcript of a long-form video. Each line is formatted
-as `[seconds] spoken text`.
+Below is a news story. Turn it into a narration script for a {target}-second
+vertical video (YouTube Shorts / TikTok style).
 
-Your job: find the ONE continuous segment that would perform best as a standalone
-vertical short.
+HARD RULES for `narration`:
+- Between {min_words} and {max_words} words. This is critical - it must fit in
+  {target} seconds of speech.
+- Open with a hook in the first sentence that makes someone stop scrolling.
+  A surprising number, a bold claim, or a direct question.
+- Plain spoken English. Short sentences. No headings, no bullet points, no
+  stage directions, no emoji, no "welcome back to the channel".
+- Do NOT write anything that is not meant to be spoken aloud.
+- Never invent facts. Only use what the story below actually says. If the story
+  is thin, say less rather than making things up.
+- End with a punchy closing line or a question to drive comments.
 
-Hard rules:
-- The segment MUST be between {min_s} and {max_s} seconds long.
-- It MUST be continuous (a single start and end, no jump cuts).
-- It MUST start at a natural sentence beginning, not mid-word.
-- It MUST make complete sense without any surrounding context.
-- Prefer segments with: a surprising claim, a strong opinion, a concrete number
-  or benchmark, a myth being busted, a clear "how to" nugget, or a bold prediction.
-- Avoid: intros, sponsor reads, "like and subscribe", rambling, pure setup with
-  no payoff, and anything where the speaker refers to something on screen that
-  the viewer cannot see.
+Also produce:
+- `title`: under 80 characters, hooky, at most one emoji.
+- `description`: 1-2 sentences.
+- `hashtags`: 4-6 lowercase tags, no '#' symbol.
+- `broll`: 5 short visual search phrases for stock footage that match the topic
+  (e.g. "gaming setup rgb", "person playing console", "server room"). Generic
+  and visual - these are searched against a stock video library, so avoid
+  proper nouns and brand names, which return nothing.
 
-Then write the publishing metadata:
-- `title`: max 80 characters, hooky, no clickbait lies, no emoji spam (1 emoji max).
-- `description`: 1 to 2 short sentences describing the clip.
-- `hashtags`: 4 to 6 relevant lowercase hashtags WITHOUT the '#' symbol.
-- `reason`: one sentence on why this segment will hook viewers.
+Return ONLY raw JSON, no markdown fences, exactly this shape:
+{{"narration": "", "title": "", "description": "", "hashtags": ["",""],
+  "broll": ["",""]}}
 
-Return ONLY raw JSON, no markdown fences, in exactly this shape:
-{{"start_seconds": 0.0, "end_seconds": 0.0, "title": "", "description": "",
-  "hashtags": ["", ""], "reason": ""}}
-
-VIDEO TITLE: {video_title}
-CHANNEL: {channel}
-
-TRANSCRIPT:
-{transcript}
+STORY TITLE: {title}
+SOURCE: {source}
+STORY BODY: {summary}
 """
 
 
-class GeminiPlanner:
+class ScriptWriter:
     BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+    AUTH_MODES = ("header", "bearer", "query")
+    # ~150 words per minute is a natural narration pace.
+    WORDS_PER_SECOND = 2.5
 
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.session = requests.Session()
         self._auth_mode: str | None = None
 
-    def plan(self, cand: Candidate, cues: list[TranscriptCue]) -> ClipPlan:
-        prompt = PROMPT_TEMPLATE.format(
-            min_s=self.cfg.min_clip_seconds,
-            max_s=self.cfg.max_clip_seconds,
-            video_title=cand.title,
-            channel=cand.channel,
-            transcript=cues_to_timestamped_text(cues),
+    def write(self, story: Story) -> VideoScript:
+        target = self.cfg.target_seconds
+        prompt = PROMPT.format(
+            topic="video games and technology",
+            target=target,
+            min_words=int(target * self.WORDS_PER_SECOND * 0.80),
+            max_words=int(target * self.WORDS_PER_SECOND * 1.05),
+            title=story.title,
+            source=story.source,
+            summary=story.summary or story.title,
         )
-        raw = self._generate(prompt)
-        plan = self._parse(raw)
-        return self._validate(plan, cues)
+        return self._validate(self._parse(self._generate(prompt)))
 
-    # Google is midway through changing its API key format. Old keys start with
-    # "AIza" and work as a ?key= query parameter. New keys start with "AQ." and
-    # are rejected that way (401 ACCESS_TOKEN_TYPE_UNSUPPORTED) - they need a
-    # header instead. We try each style until one works, then remember it.
-    AUTH_MODES = ("header", "bearer", "query")
+    # -- transport ----------------------------------------------------------
 
     def _send(self, url: str, payload: dict[str, Any], mode: str) -> requests.Response:
         headers: dict[str, str] = {}
@@ -829,347 +492,565 @@ class GeminiPlanner:
             headers["Authorization"] = f"Bearer {key}"
         else:
             params["key"] = key
-        return self.session.post(
-            url, params=params, headers=headers, json=payload, timeout=120
-        )
+        return self.session.post(url, params=params, headers=headers,
+                                 json=payload, timeout=120)
 
-    @retry(times=4, delay=8.0, exceptions=(requests.RequestException, GeminiError))
+    @retry(times=3, delay=8.0, exceptions=(requests.RequestException, ScriptError))
     def _generate(self, prompt: str) -> str:
         url = f"{self.BASE}/{self.cfg.gemini_model}:generateContent"
         payload = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {
-                "temperature": 0.7,
-                "maxOutputTokens": 1024,
+                "temperature": 0.85,
+                "maxOutputTokens": 1200,
                 "responseMimeType": "application/json",
             },
         }
 
-        # If we already know which auth style this key likes, go straight to it.
+        # Google is midway through changing key formats: old "AIza" keys work as
+        # a ?key= parameter, new "AQ." keys must go in a header. Try each once,
+        # then remember whichever worked.
         modes = (self._auth_mode,) if self._auth_mode else self.AUTH_MODES
-        resp = None
-        rejected: list[str] = []
-
+        resp, rejected = None, []
         for mode in modes:
             resp = self._send(url, payload, mode)
             if resp.status_code in (401, 403) and not self._auth_mode:
                 rejected.append(f"{mode}={resp.status_code}")
-                log.info("Gemini rejected the %s auth style - trying the next one.", mode)
                 continue
             if resp.status_code < 400:
-                if self._auth_mode != mode:
-                    log.info("Gemini accepted the '%s' auth style.", mode)
                 self._auth_mode = mode
             break
 
         if resp is None:  # pragma: no cover - defensive
-            raise GeminiError("Gemini request was never sent.")
-
+            raise ScriptError("Gemini request was never sent.")
         if resp.status_code in (401, 403):
-            # A rejected key is never a temporary glitch, so raise ConfigError
-            # rather than GeminiError: that skips the retries AND stops the whole
-            # run instead of burning through every candidate with a dead key.
             raise ConfigError(
                 f"Gemini rejected your API key with every auth style ({', '.join(rejected)}). "
-                f"Key starts with '{self.cfg.gemini_api_key[:4]}'. "
-                "If it starts with 'AQ.', create a replacement key from the Google Cloud "
-                "Console instead of AI Studio (see the README) - those come out in the "
-                f"older 'AIza' format. Server said: {resp.text[:300]}"
+                f"Key starts with '{self.cfg.gemini_api_key[:4]}'. If it starts with 'AQ.', "
+                "make a replacement key in the Google Cloud Console instead of AI Studio - "
+                f"see the README. Server said: {resp.text[:250]}"
             )
         if resp.status_code == 429:
-            raise GeminiError("Gemini free-tier rate limit hit (429).")
+            raise ScriptError("Gemini free-tier rate limit hit (429).")
         if resp.status_code >= 400:
-            raise GeminiError(f"Gemini HTTP {resp.status_code}: {resp.text[:400]}")
+            raise ScriptError(f"Gemini HTTP {resp.status_code}: {resp.text[:300]}")
 
         data = resp.json()
         candidates = data.get("candidates") or []
         if not candidates:
-            feedback = data.get("promptFeedback", {})
-            raise GeminiError(f"Gemini returned no candidates. Feedback: {feedback}")
+            raise ScriptError(f"Gemini returned nothing. {data.get('promptFeedback', {})}")
         parts = (candidates[0].get("content") or {}).get("parts") or []
         text = "".join(p.get("text", "") for p in parts).strip()
         if not text:
-            raise GeminiError("Gemini returned an empty response body.")
+            raise ScriptError("Gemini returned an empty body.")
         return text
 
+    # -- parsing ------------------------------------------------------------
+
     @staticmethod
-    def _parse(raw: str) -> ClipPlan:
-        cleaned = raw.strip()
-        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.MULTILINE).strip()
+    def _parse(raw: str) -> VideoScript:
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
         match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
         if not match:
-            raise GeminiError(f"No JSON object found in Gemini output: {raw[:300]}")
+            raise ScriptError(f"No JSON found in Gemini output: {raw[:200]}")
         try:
             obj = json.loads(match.group(0))
         except json.JSONDecodeError as exc:
-            raise GeminiError(f"Gemini JSON was malformed: {exc}") from exc
+            raise ScriptError(f"Gemini JSON was malformed: {exc}") from exc
 
-        try:
-            start = float(obj["start_seconds"])
-            end = float(obj["end_seconds"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise GeminiError(f"Gemini JSON missing usable timestamps: {obj}") from exc
+        def as_list(value: Any, limit: int) -> list[str]:
+            if isinstance(value, str):
+                value = [v.strip() for v in value.split(",")]
+            return [str(v).strip() for v in (value or []) if str(v).strip()][:limit]
 
-        tags = obj.get("hashtags") or []
-        if isinstance(tags, str):
-            tags = [t.strip() for t in tags.split(",")]
-        tags = [re.sub(r"[^a-z0-9]", "", str(t).lower()) for t in tags]
-        tags = [t for t in tags if t][:6]
+        tags = [re.sub(r"[^a-z0-9]", "", t.lower()) for t in as_list(obj.get("hashtags"), 6)]
 
-        return ClipPlan(
-            start=start,
-            end=end,
-            title=str(obj.get("title") or "").strip()[:95] or "AI Insight",
+        return VideoScript(
+            narration=str(obj.get("narration") or "").strip(),
+            title=str(obj.get("title") or "").strip()[:95],
             description=str(obj.get("description") or "").strip()[:400],
-            hashtags=tags or ["ai", "tech", "shorts"],
-            reason=str(obj.get("reason") or "").strip()[:300],
+            hashtags=[t for t in tags if t] or ["gaming", "tech", "shorts"],
+            broll=as_list(obj.get("broll"), 6),
         )
 
-    def _validate(self, plan: ClipPlan, cues: list[TranscriptCue]) -> ClipPlan:
-        transcript_end = cues[-1].end if cues else 0.0
-        if plan.start < 0:
-            plan.start = 0.0
-        if plan.end <= plan.start:
-            raise GeminiError(f"Gemini gave an inverted range: {plan.start} -> {plan.end}")
+    def _validate(self, script: VideoScript) -> VideoScript:
+        # Strip anything that is clearly not meant to be spoken.
+        narration = re.sub(r"\[[^\]]{0,60}\]", " ", script.narration)   # [SFX]
+        narration = re.sub(r"\*[^*]{0,60}\*", " ", narration)           # *pause*
+        narration = re.sub(r"^\s*(NARRATOR|VO|HOST)\s*:\s*", "", narration,
+                           flags=re.IGNORECASE | re.MULTILINE)
+        narration = re.sub(r"\s+", " ", narration).strip()
+        if not narration:
+            raise ScriptError("Gemini produced an empty narration.")
 
-        # Clamp the duration into our allowed window instead of failing outright.
-        duration = plan.duration
-        if duration < self.cfg.min_clip_seconds:
-            log.info("Clip was %.1fs - extending to %ds.", duration, self.cfg.min_clip_seconds)
-            plan.end = plan.start + self.cfg.min_clip_seconds
-        elif duration > self.cfg.max_clip_seconds:
-            log.info("Clip was %.1fs - trimming to %ds.", duration, self.cfg.max_clip_seconds)
-            plan.end = plan.start + self.cfg.max_clip_seconds
+        ceiling = int(self.cfg.max_seconds * self.WORDS_PER_SECOND)
+        words = narration.split()
+        if len(words) > ceiling:
+            # Trim to the last complete sentence that fits.
+            trimmed = " ".join(words[:ceiling])
+            cut = max(trimmed.rfind("."), trimmed.rfind("!"), trimmed.rfind("?"))
+            narration = trimmed[: cut + 1] if cut > 40 else trimmed
+            log.info("Narration was %d words - trimmed to %d.",
+                     len(words), len(narration.split()))
 
-        if transcript_end and plan.end > transcript_end + 5:
-            shift = plan.end - transcript_end
-            plan.start = max(0.0, plan.start - shift)
-            plan.end = max(plan.start + self.cfg.min_clip_seconds, transcript_end)
-            log.info("Clip ran past the transcript - shifted back to %.1f-%.1f.",
-                     plan.start, plan.end)
-
-        log.info(
-            "Gemini picked %s -> %s (%.1fs) | %s",
-            hhmmss(plan.start), hhmmss(plan.end), plan.duration, plan.title,
-        )
-        if plan.reason:
-            log.info("Reason: %s", plan.reason)
-        return plan
-
-
-# ---------------------------------------------------------------------------
-# STEP 3 - Download just the segment with yt-dlp
-# ---------------------------------------------------------------------------
-
-
-def write_cookie_file(cfg: Config, workdir: Path) -> Path | None:
-    """Turn the YT_COOKIES secret into a file yt-dlp can read. Shared by the
-    transcript fetcher and the downloader so both get the same session."""
-    if not cfg.yt_cookies:
-        log.info("No YT_COOKIES secret set. If YouTube blocks this runner, add one.")
-        return None
-
-    # GitHub Secrets sometimes collapse literal \n - repair them.
-    content = cfg.yt_cookies.replace("\\n", "\n").replace("\r\n", "\n")
-    if not content.endswith("\n"):
-        content += "\n"
-
-    # yt-dlp demands the Netscape header. Pasting the wrong thing (JSON, a
-    # header string, a half-copied file) is the single most common mistake,
-    # so fail loudly here rather than 25 confusing candidate failures later.
-    first = content.lstrip().split("\n", 1)[0].strip()
-    if not first.startswith(("# HTTP Cookie File", "# Netscape HTTP Cookie File")):
-        # A real Netscape cookie line has 7 tab-separated fields, so 6 tabs.
-        if content.count("\t") >= 6:
-            # Right shape, missing header - just add it.
-            content = "# Netscape HTTP Cookie File\n" + content
-            log.warning("YT_COOKIES was missing its header line - added it.")
-        else:
-            raise ConfigError(
-                "YT_COOKIES does not look like a Netscape cookies.txt file. It must "
-                "start with '# Netscape HTTP Cookie File' and contain tab-separated "
-                f"lines. Yours starts with: {first[:60]!r}. Re-export it with a "
-                "'Get cookies.txt LOCALLY' browser extension and paste the whole file."
+        if len(narration.split()) < 25:
+            raise ScriptError(
+                f"Narration is only {len(narration.split())} words - too thin to use."
             )
 
-    lines = [l for l in content.split("\n") if l.strip() and not l.startswith("#")]
-    youtube_lines = [l for l in lines if "youtube.com" in l or "google.com" in l]
-    if not youtube_lines:
-        raise ConfigError(
-            f"YT_COOKIES has {len(lines)} cookie line(s) but none for youtube.com. "
-            "Export the cookies while you are ON youtube.com and signed in."
-        )
+        script.narration = narration
+        if not script.title:
+            script.title = " ".join(narration.split()[:9])
+        if not script.broll:
+            script.broll = ["video game controller", "gaming setup", "computer screen code"]
 
-    path = workdir / "cookies.txt"
-    path.write_text(content, encoding="utf-8")
-    os.chmod(path, 0o600)
-    log.info("Loaded YT_COOKIES (%d cookies, %d for YouTube/Google).",
-             len(lines), len(youtube_lines))
-    return path
-
-
-class SegmentDownloader:
-    def __init__(self, cfg: Config, workdir: Path, cookie_file: Path | None = None) -> None:
-        self.cfg = cfg
-        self.workdir = workdir
-        self.cookie_file = cookie_file
-
-    def download(self, cand: Candidate, plan: ClipPlan) -> Path:
-        try:
-            import yt_dlp  # type: ignore
-            from yt_dlp.utils import download_range_func  # type: ignore
-        except ImportError as exc:  # pragma: no cover
-            raise DownloadError("yt-dlp is not installed.") from exc
-
-        out_template = str(self.workdir / "raw.%(ext)s")
-        # A little padding so FFmpeg keyframe snapping never clips the first word.
-        start = max(0.0, plan.start - 0.3)
-        end = plan.end + 0.3
-
-        opts: dict[str, Any] = {
-            "format": (
-                "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
-                "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"
-            ),
-            "merge_output_format": "mp4",
-            "outtmpl": out_template,
-            "download_ranges": download_range_func(None, [(start, end)]),
-            "force_keyframes_at_cuts": True,
-            "noprogress": True,
-            "quiet": True,
-            "no_warnings": True,
-            "retries": 5,
-            "fragment_retries": 5,
-            "socket_timeout": 45,
-            "concurrent_fragment_downloads": 4,
-            "geo_bypass": True,
-            # Web client is the least likely to trip "confirm you're not a bot".
-            "extractor_args": {"youtube": {"player_client": ["web_safari", "web"]}},
-        }
-        if self.cookie_file:
-            opts["cookiefile"] = str(self.cookie_file)
-        if self.cfg.proxy_url:
-            opts["proxy"] = self.cfg.proxy_url
-
-        log.info("Downloading %s from %s to %s ...", cand.video_id, hhmmss(start), hhmmss(end))
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([cand.url])
-        except Exception as exc:
-            raise DownloadError(
-                f"yt-dlp failed for {cand.video_id}: {exc}. "
-                "If this says 'Sign in to confirm you're not a bot', add the "
-                "YT_COOKIES and/or PROXY_URL secrets."
-            ) from exc
-
-        produced = sorted(
-            (p for p in self.workdir.glob("raw.*") if p.suffix.lower() != ".part"),
-            key=lambda p: p.stat().st_size,
-            reverse=True,
-        )
-        if not produced or produced[0].stat().st_size < 50_000:
-            raise DownloadError("yt-dlp produced no usable file (or an empty one).")
-        log.info("Downloaded %s (%.1f MB).", produced[0].name,
-                 produced[0].stat().st_size / 1_048_576)
-        return produced[0]
+        log.info("Script: %d words (~%.0fs) | %s",
+                 script.word_count, script.word_count / self.WORDS_PER_SECOND, script.title)
+        return script
 
 
 # ---------------------------------------------------------------------------
-# STEP 3 (cont.) - Reframe to 9:16 with FFmpeg
+# STEP 3 - Narration via Microsoft Edge TTS (free, no API key)
 # ---------------------------------------------------------------------------
 
 
-class VerticalRenderer:
-    WIDTH, HEIGHT = 1080, 1920
+@dataclass
+class SpokenWord:
+    text: str
+    start: float     # seconds
+    end: float
+
+
+class Narrator:
+    """Edge TTS gives us audio AND word-level timings in one pass.
+
+    Those timings are what make burned-in captions possible without running any
+    speech recognition - we already know exactly when each word is spoken.
+    """
 
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
-        self.ffmpeg = shutil.which("ffmpeg")
-        self.ffprobe = shutil.which("ffprobe")
-        if not self.ffmpeg:
-            raise RenderError(
-                "ffmpeg was not found on PATH. GitHub's ubuntu-latest runner ships "
-                "with it; add an apt-get install step if you changed the runner."
-            )
 
-    def probe_duration(self, path: Path) -> float:
-        if not self.ffprobe:
-            return 0.0
+    def speak(self, text: str, dest: Path) -> tuple[Path, list[SpokenWord]]:
         try:
-            out = subprocess.run(
-                [self.ffprobe, "-v", "error", "-show_entries", "format=duration",
-                 "-of", "default=nw=1:nk=1", str(path)],
-                capture_output=True, text=True, timeout=60, check=True,
-            )
-            return float(out.stdout.strip() or 0)
-        except (subprocess.SubprocessError, ValueError):
-            return 0.0
+            import edge_tts  # type: ignore  # noqa: F401
+        except ImportError as exc:  # pragma: no cover
+            raise NarrationError("edge-tts is not installed.") from exc
 
-    def _filter_chain(self) -> str:
-        if self.cfg.crop_mode == "center":
-            # Hard centre crop: fills the frame, loses the left/right edges.
-            return (
-                f"scale={self.WIDTH}:{self.HEIGHT}:force_original_aspect_ratio=increase,"
-                f"crop={self.WIDTH}:{self.HEIGHT},setsar=1"
-            )
-        # Blurred-background composite: keeps the whole frame, fills the gaps.
-        return (
-            "[0:v]split=2[bg][fg];"
-            f"[bg]scale={self.WIDTH}:{self.HEIGHT}:force_original_aspect_ratio=increase,"
-            f"crop={self.WIDTH}:{self.HEIGHT},gblur=sigma=25,eq=brightness=-0.08[bgb];"
-            f"[fg]scale={self.WIDTH}:{self.HEIGHT}:force_original_aspect_ratio=decrease[fgs];"
-            "[bgb][fgs]overlay=(W-w)/2:(H-h)/2,setsar=1[v]"
+        last: Exception | None = None
+        for voice in (self.cfg.voice, self.cfg.fallback_voice):
+            for attempt in (1, 2):
+                try:
+                    words = asyncio.run(self._synth(text, voice, dest))
+                    if dest.exists() and dest.stat().st_size > 8_000:
+                        log.info("Narration OK with %s (%.1f KB, %d word timings).",
+                                 voice, dest.stat().st_size / 1024, len(words))
+                        return dest, words
+                    last = NarrationError(f"{voice} produced an empty audio file.")
+                except Exception as exc:
+                    last = exc
+                    log.warning("TTS attempt %d with %s failed: %s",
+                                attempt, voice, str(exc)[:160])
+                time.sleep(3 * attempt)
+
+        raise NarrationError(
+            f"Text-to-speech failed for every voice. Last error: {last}. "
+            "Edge's free TTS service occasionally rate-limits; the next run "
+            "usually succeeds."
         )
 
-    def render(self, source: Path, dest: Path, plan: ClipPlan) -> Path:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        chain = self._filter_chain()
+    async def _synth(self, text: str, voice: str, dest: Path) -> list[SpokenWord]:
+        import edge_tts  # type: ignore
 
-        cmd = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source)]
-        if self.cfg.crop_mode == "center":
-            cmd += ["-vf", chain]
-        else:
-            cmd += ["-filter_complex", chain, "-map", "[v]", "-map", "0:a?"]
-        cmd += [
-            "-t", f"{min(plan.duration, self.cfg.max_clip_seconds):.2f}",
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "21",
-            "-profile:v", "high",
-            "-pix_fmt", "yuv420p",
-            "-r", "30",
-            "-g", "60",
-            "-c:a", "aac",
-            "-b:a", "160k",
-            "-ar", "44100",
-            "-ac", "2",
-            "-movflags", "+faststart",
-            str(dest),
-        ]
+        communicate = edge_tts.Communicate(text, voice, rate=self.cfg.speech_rate)
+        words: list[SpokenWord] = []
+        with dest.open("wb") as handle:
+            async for chunk in communicate.stream():
+                kind = chunk.get("type")
+                if kind == "audio" and chunk.get("data"):
+                    handle.write(chunk["data"])
+                elif kind == "WordBoundary":
+                    # Offsets arrive in 100-nanosecond ticks.
+                    start = chunk.get("offset", 0) / 10_000_000
+                    dur = chunk.get("duration", 0) / 10_000_000
+                    word = (chunk.get("text") or "").strip()
+                    if word:
+                        words.append(SpokenWord(word, start, start + dur))
+        return words
 
-        log.info("Rendering 9:16 vertical (%s mode) ...", self.cfg.crop_mode)
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-        except subprocess.TimeoutExpired as exc:
-            raise RenderError("FFmpeg timed out after 15 minutes.") from exc
 
-        if proc.returncode != 0:
-            raise RenderError(f"FFmpeg exited {proc.returncode}: {proc.stderr[-1200:]}")
-        if not dest.exists() or dest.stat().st_size < 20_000:
-            raise RenderError("FFmpeg produced no output (or a suspiciously tiny file).")
+# ---------------------------------------------------------------------------
+# STEP 4 - Captions (.ass) built from the word timings
+# ---------------------------------------------------------------------------
 
-        duration = self.probe_duration(dest)
-        if duration and duration > 61:
-            raise RenderError(
-                f"Rendered clip is {duration:.1f}s - YouTube will not treat it as a Short."
+
+class CaptionBuilder:
+    """Groups spoken words into short on-screen phrases and writes an ASS file."""
+
+    MAX_WORDS = 4
+    # At 78px bold, ~18 characters is the widest line that fits inside the
+    # 1080px frame once the 70px side margins are taken off. Going wider
+    # pushes text off both edges.
+    MAX_CHARS = 18
+
+    ASS_HEADER = textwrap.dedent("""\
+        [Script Info]
+        ScriptType: v4.00+
+        PlayResX: 1080
+        PlayResY: 1920
+        WrapStyle: 0
+        ScaledBorderAndShadow: yes
+
+        [V4+ Styles]
+        Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+        Style: Pop,{font},78,&H00FFFFFF,&H00FFFFFF,&H00101010,&H90000000,-1,0,0,0,100,100,0,0,1,7,3,2,70,70,560,1
+
+        [Events]
+        Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Encoding, Text
+        """)
+
+    def __init__(self, font: str = "DejaVu Sans") -> None:
+        self.font = font
+
+    @staticmethod
+    def _stamp(seconds: float) -> str:
+        seconds = max(0.0, seconds)
+        hours, rem = divmod(seconds, 3600)
+        mins, secs = divmod(rem, 60)
+        return f"{int(hours)}:{int(mins):02d}:{secs:05.2f}"
+
+    def group(self, words: list[SpokenWord]) -> list[tuple[float, float, str]]:
+        chunks: list[tuple[float, float, str]] = []
+        bucket: list[SpokenWord] = []
+
+        def flush() -> None:
+            if not bucket:
+                return
+            text = " ".join(w.text for w in bucket)
+            chunks.append((bucket[0].start, bucket[-1].end, text))
+            bucket.clear()
+
+        for word in words:
+            candidate = " ".join([*(w.text for w in bucket), word.text])
+            too_long = len(bucket) >= self.MAX_WORDS or len(candidate) > self.MAX_CHARS
+            # A pause of more than a third of a second reads as a new phrase.
+            gap = bucket and (word.start - bucket[-1].end) > 0.35
+            if bucket and (too_long or gap):
+                flush()
+            bucket.append(word)
+            if word.text.endswith((".", "!", "?")):
+                flush()
+        flush()
+
+        # Close small gaps so captions do not flicker off between phrases.
+        for i in range(len(chunks) - 1):
+            start, end, text = chunks[i]
+            next_start = chunks[i + 1][0]
+            if 0 < next_start - end < 0.30:
+                chunks[i] = (start, next_start, text)
+        return chunks
+
+    def write(self, words: list[SpokenWord], dest: Path) -> Path | None:
+        chunks = self.group(words)
+        if not chunks:
+            log.warning("No word timings available - the video will have no captions.")
+            return None
+
+        lines = [self.ASS_HEADER.format(font=self.font)]
+        for start, end, text in chunks:
+            safe = text.replace("\\", "").replace("{", "(").replace("}", ")")
+            lines.append(
+                f"Dialogue: 0,{self._stamp(start)},{self._stamp(end)},Pop,,0,0,0,,"
+                f"{{\\fad(90,90)}}{safe.upper()}"
             )
-        log.info("Rendered %s (%.1f MB, %.1fs).", dest.name,
-                 dest.stat().st_size / 1_048_576, duration)
+        dest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        log.info("Captions: %d phrases written.", len(chunks))
         return dest
 
 
 # ---------------------------------------------------------------------------
-# STEP 4 - Upload to YouTube as a Short
+# STEP 5 - Background footage from Pexels (optional)
+# ---------------------------------------------------------------------------
+
+
+class FootageFetcher:
+    SEARCH = "https://api.pexels.com/videos/search"
+
+    def __init__(self, cfg: Config, workdir: Path) -> None:
+        self.cfg = cfg
+        self.workdir = workdir
+
+    def fetch(self, queries: list[str], needed: int) -> list[Path]:
+        if not self.cfg.pexels_api_key:
+            log.info("No PEXELS_API_KEY set - using a generated gradient background.")
+            return []
+
+        session = requests.Session()
+        session.headers.update({"Authorization": self.cfg.pexels_api_key})
+        clips: list[Path] = []
+        seen_ids: set[int] = set()
+
+        for query in queries:
+            if len(clips) >= needed:
+                break
+            try:
+                resp = session.get(self.SEARCH, timeout=30, params={
+                    "query": query, "per_page": 12,
+                    "orientation": "portrait", "size": "medium",
+                })
+                if resp.status_code == 401:
+                    log.error("Pexels rejected PEXELS_API_KEY - falling back to gradient.")
+                    return []
+                resp.raise_for_status()
+                videos = resp.json().get("videos") or []
+            except Exception as exc:
+                log.warning("Pexels search failed for %r: %s", query, str(exc)[:120])
+                continue
+
+            log.info("Pexels %-28r -> %d result(s)", query, len(videos))
+            for video in videos:
+                if len(clips) >= needed:
+                    break
+                vid = video.get("id")
+                if vid in seen_ids or (video.get("duration") or 0) < 4:
+                    continue
+                best = self._best_file(video.get("video_files") or [])
+                if not best:
+                    continue
+                path = self._download(best["link"], len(clips), session)
+                if path:
+                    seen_ids.add(vid)
+                    clips.append(path)
+
+        if not clips:
+            log.warning("Pexels returned nothing usable - using a gradient background.")
+        else:
+            log.info("Downloaded %d stock clip(s).", len(clips))
+        return clips
+
+    @staticmethod
+    def _best_file(files: list[dict[str, Any]]) -> dict[str, Any] | None:
+        usable = [f for f in files
+                  if f.get("link") and f.get("file_type") == "video/mp4" and f.get("height")]
+        if not usable:
+            return None
+        portrait = [f for f in usable if (f.get("height") or 0) > (f.get("width") or 0)]
+        pool = portrait or usable
+        # Big enough to fill 1080x1920, but not a needlessly huge download.
+        sized = [f for f in pool if 1000 <= (f.get("height") or 0) <= 2200]
+        return max(sized or pool, key=lambda f: f.get("height") or 0)
+
+    def _download(self, url: str, index: int, session: requests.Session) -> Path | None:
+        path = self.workdir / f"stock_{index:02d}.mp4"
+        try:
+            with session.get(url, stream=True, timeout=120) as resp:
+                resp.raise_for_status()
+                size = 0
+                with path.open("wb") as handle:
+                    for block in resp.iter_content(1 << 16):
+                        handle.write(block)
+                        size += len(block)
+                        if size > 60 * 1024 * 1024:   # don't let one clip run away
+                            break
+            if path.stat().st_size < 40_000:
+                path.unlink(missing_ok=True)
+                return None
+            return path
+        except Exception as exc:
+            log.warning("Stock clip download failed: %s", str(exc)[:120])
+            path.unlink(missing_ok=True)
+            return None
+
+
+# ---------------------------------------------------------------------------
+# STEP 6 - Assemble the vertical video with FFmpeg
+# ---------------------------------------------------------------------------
+
+
+class VideoAssembler:
+    WIDTH, HEIGHT, FPS = 1080, 1920, 30
+
+    def __init__(self, cfg: Config, workdir: Path) -> None:
+        self.cfg = cfg
+        self.workdir = workdir
+        self.ffmpeg = shutil.which("ffmpeg")
+        self.ffprobe = shutil.which("ffprobe")
+        if not self.ffmpeg or not self.ffprobe:
+            raise RenderError(
+                "ffmpeg/ffprobe not found on PATH. GitHub's ubuntu-latest runner "
+                "ships with them; add an apt-get install step if you changed runner."
+            )
+
+    # -- helpers ------------------------------------------------------------
+
+    def _run(self, cmd: list[str], label: str, timeout: int = 900) -> None:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise RenderError(f"FFmpeg timed out during {label}.") from exc
+        if proc.returncode != 0:
+            raise RenderError(f"FFmpeg failed during {label}: {proc.stderr[-1000:]}")
+
+    def duration(self, path: Path) -> float:
+        try:
+            out = subprocess.run(
+                [self.ffprobe, "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=nw=1:nk=1", str(path)],
+                capture_output=True, text=True, timeout=60, check=True)
+            return float(out.stdout.strip() or 0)
+        except (subprocess.SubprocessError, ValueError):
+            return 0.0
+
+    # -- background ---------------------------------------------------------
+
+    def _normalise(self, clip: Path, index: int, seconds: float) -> Path | None:
+        """Crop/scale one stock clip to a 1080x1920 segment, with a slow zoom."""
+        out = self.workdir / f"seg_{index:02d}.mp4"
+        chain = (
+            f"scale={self.WIDTH}:{self.HEIGHT}:force_original_aspect_ratio=increase,"
+            f"crop={self.WIDTH}:{self.HEIGHT},fps={self.FPS},"
+            "eq=brightness=-0.06:saturation=1.1,setsar=1"
+        )
+        cmd = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+               "-stream_loop", "-1", "-i", str(clip),
+               "-t", f"{seconds:.2f}", "-an", "-vf", chain,
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+               "-pix_fmt", "yuv420p", str(out)]
+        try:
+            self._run(cmd, f"normalising clip {index}", timeout=300)
+        except RenderError as exc:
+            log.warning("Skipping unusable stock clip %d: %s", index, str(exc)[:140])
+            return None
+        return out if out.exists() and out.stat().st_size > 20_000 else None
+
+    def _gradient(self, seconds: float) -> Path:
+        """Fallback background when we have no stock footage."""
+        out = self.workdir / "bg_gradient.mp4"
+        palettes = [("0x0f2027", "0x2c5364"), ("0x1a1a2e", "0x533483"),
+                    ("0x11998e", "0x0f2027"), ("0x232526", "0x414345")]
+        c0, c1 = random.choice(palettes)
+        source = (
+            f"gradients=s={self.WIDTH}x{self.HEIGHT}:c0={c0}:c1={c1}"
+            f":x0=0:y0=0:x1={self.WIDTH}:y1={self.HEIGHT}"
+            f":d={max(6, int(seconds))}:speed=0.012:r={self.FPS}"
+        )
+        cmd = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+               "-f", "lavfi", "-i", source, "-t", f"{seconds:.2f}",
+               "-vf", f"format=yuv420p,setsar=1",
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", str(out)]
+        try:
+            self._run(cmd, "gradient background", timeout=300)
+            return out
+        except RenderError:
+            log.warning("gradients filter unavailable - using a flat colour.")
+            cmd = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                   "-f", "lavfi",
+                   "-i", f"color=c=0x14161c:s={self.WIDTH}x{self.HEIGHT}:r={self.FPS}",
+                   "-t", f"{seconds:.2f}", "-vf", "format=yuv420p",
+                   "-c:v", "libx264", "-preset", "veryfast", str(out)]
+            self._run(cmd, "flat colour background", timeout=300)
+            return out
+
+    def build_background(self, clips: list[Path], seconds: float) -> Path:
+        if not clips:
+            return self._gradient(seconds)
+
+        per_clip = max(3.0, seconds / len(clips))
+        segments: list[Path] = []
+        for index, clip in enumerate(clips):
+            segment = self._normalise(clip, index, per_clip)
+            if segment:
+                segments.append(segment)
+
+        if not segments:
+            return self._gradient(seconds)
+
+        # Repeat the sequence until it is long enough to cover the narration.
+        # This must run even for a single segment: if some clips failed to
+        # normalise, one surviving segment is shorter than the narration, and
+        # a short background silently truncates the audio via -shortest.
+        ordered: list[Path] = []
+        covered = 0.0
+        while covered < seconds + 1 and len(ordered) < 40:
+            for segment in segments:
+                ordered.append(segment)
+                covered += per_clip
+                if covered >= seconds + 1:
+                    break
+
+        listing = self.workdir / "concat.txt"
+        listing.write_text(
+            "".join(f"file '{p.resolve().as_posix()}'\n" for p in ordered),
+            encoding="utf-8")
+
+        out = self.workdir / "bg.mp4"
+        self._run([self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                   "-f", "concat", "-safe", "0", "-i", str(listing),
+                   "-t", f"{seconds:.2f}", "-c", "copy", str(out)],
+                  "joining background segments")
+
+        made = self.duration(out)
+        if made < seconds - 0.5:
+            log.warning("Background came out %.1fs for %.1fs of narration - "
+                        "falling back to a gradient so nothing gets cut off.",
+                        made, seconds)
+            return self._gradient(seconds)
+        return out
+
+    # -- final mux ----------------------------------------------------------
+
+    def assemble(self, background: Path, narration: Path,
+                 captions: Path | None, dest: Path) -> Path:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        speech = self.duration(narration)
+
+        # A dark vignette under the captions keeps them readable on any footage.
+        filters = [
+            "[0:v]scale=%d:%d,setsar=1[base]" % (self.WIDTH, self.HEIGHT),
+            "color=c=black@0.38:s=%dx270:r=%d[shade]" % (self.WIDTH, self.FPS),
+            "[base][shade]overlay=0:H-800:shortest=1[shaded]",
+        ]
+        last = "shaded"
+        if captions:
+            escaped = str(captions.resolve()).replace("\\", "/").replace(":", r"\:")
+            filters.append(f"[{last}]subtitles='{escaped}'[v]")
+            last = "v"
+        else:
+            filters.append(f"[{last}]null[v]")
+            last = "v"
+
+        cmd = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+               "-i", str(background), "-i", str(narration),
+               "-filter_complex", ";".join(filters),
+               "-map", "[v]", "-map", "1:a",
+               "-c:v", "libx264", "-preset", "medium", "-crf", "21",
+               "-profile:v", "high", "-pix_fmt", "yuv420p",
+               "-r", str(self.FPS), "-g", str(self.FPS * 2),
+               "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+               "-shortest", "-movflags", "+faststart", str(dest)]
+        self._run(cmd, "final assembly")
+
+        if not dest.exists() or dest.stat().st_size < 30_000:
+            raise RenderError("FFmpeg produced no output (or a tiny broken file).")
+        length = self.duration(dest)
+        if length > 60.5:
+            raise RenderError(
+                f"Rendered clip is {length:.1f}s - YouTube will not treat it as a Short."
+            )
+        # The narration must survive intact. A background shorter than the audio
+        # would silently cut the voice off mid-sentence via -shortest.
+        if speech and length < min(speech, self.cfg.max_seconds) - 0.75:
+            raise RenderError(
+                f"Video is {length:.1f}s but the narration is {speech:.1f}s - the "
+                "voiceover would be cut off. Refusing to upload a truncated video."
+            )
+        log.info("Rendered %s (%.1f MB, %.1fs).",
+                 dest.name, dest.stat().st_size / 1_048_576, length)
+        return dest
+
+
+# ---------------------------------------------------------------------------
+# STEP 7 - Upload to YouTube as a Short
 # ---------------------------------------------------------------------------
 
 
@@ -1179,13 +1060,17 @@ class YouTubeUploader:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
 
-    def _credentials(self):
+    def upload(self, video: Path, script: VideoScript, story: Story) -> str:
         try:
+            from googleapiclient.discovery import build  # type: ignore
+            from googleapiclient.errors import HttpError  # type: ignore
+            from googleapiclient.http import MediaFileUpload  # type: ignore
+            from google.auth.transport.requests import Request  # type: ignore
             from google.oauth2.credentials import Credentials  # type: ignore
         except ImportError as exc:  # pragma: no cover
-            raise UploadError("google-auth is not installed.") from exc
+            raise UploadError("google-api-python-client is not installed.") from exc
 
-        return Credentials(
+        creds = Credentials(
             token=None,
             refresh_token=self.cfg.yt_refresh_token,
             client_id=self.cfg.yt_client_id,
@@ -1193,48 +1078,37 @@ class YouTubeUploader:
             token_uri="https://oauth2.googleapis.com/token",
             scopes=self.SCOPES,
         )
-
-    def upload(self, video: Path, plan: ClipPlan, cand: Candidate) -> str:
-        try:
-            from googleapiclient.discovery import build  # type: ignore
-            from googleapiclient.errors import HttpError  # type: ignore
-            from googleapiclient.http import MediaFileUpload  # type: ignore
-            from google.auth.transport.requests import Request  # type: ignore
-        except ImportError as exc:  # pragma: no cover
-            raise UploadError("google-api-python-client is not installed.") from exc
-
-        creds = self._credentials()
         try:
             creds.refresh(Request())
         except Exception as exc:
             raise UploadError(
                 f"Could not refresh the YouTube OAuth token: {exc}. "
-                "Re-generate YT_REFRESH_TOKEN (see README step 4)."
+                "Re-generate YT_REFRESH_TOKEN (README step 4), and make sure you "
+                "clicked 'Publish app' on the OAuth consent screen."
             ) from exc
 
-        title = self._build_title(plan)
+        title = script.title if "#short" in script.title.lower() else f"{script.title} #Shorts"
         body = {
             "snippet": {
-                "title": title,
-                "description": self._build_description(plan, cand),
-                "tags": (plan.hashtags + ["shorts", "ai", "technology"])[:15],
-                "categoryId": "28",  # Science & Technology
+                "title": title[:100],
+                "description": self._description(script, story),
+                "tags": (script.hashtags + ["shorts", "gaming", "technology"])[:15],
+                "categoryId": "20",   # Gaming
             },
             "status": {
                 "privacyStatus": self.cfg.upload_privacy,
                 "selfDeclaredMadeForKids": False,
-                "license": "creativeCommon",
             },
         }
 
         youtube = build("youtube", "v3", credentials=creds, cache_discovery=False)
-        media = MediaFileUpload(str(video), chunksize=4 * 1024 * 1024, resumable=True,
-                                mimetype="video/mp4")
-        request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+        media = MediaFileUpload(str(video), chunksize=4 * 1024 * 1024,
+                                resumable=True, mimetype="video/mp4")
+        request = youtube.videos().insert(part="snippet,status", body=body,
+                                          media_body=media)
 
         log.info("Uploading to YouTube as %s ...", self.cfg.upload_privacy)
-        response = None
-        errors = 0
+        response, errors = None, 0
         while response is None:
             try:
                 status, response = request.next_chunk()
@@ -1253,26 +1127,18 @@ class YouTubeUploader:
                 time.sleep(2 ** errors)
 
         video_id = response.get("id", "")
-        log.info("YouTube upload complete: https://youtube.com/shorts/%s", video_id)
+        log.info("Upload complete: https://youtube.com/shorts/%s", video_id)
         return video_id
 
     @staticmethod
-    def _build_title(plan: ClipPlan) -> str:
-        title = plan.title.strip()
-        if "#shorts" not in title.lower():
-            title = f"{title} #Shorts"
-        return title[:100]
-
-    @staticmethod
-    def _build_description(plan: ClipPlan, cand: Candidate) -> str:
-        tags = " ".join(f"#{t}" for t in plan.hashtags)
+    def _description(script: VideoScript, story: Story) -> str:
+        tags = " ".join(f"#{t}" for t in script.hashtags)
         return (
-            f"{plan.description}\n\n"
+            f"{script.description}\n\n"
             f"{tags} #Shorts\n\n"
             "-----\n"
-            "ATTRIBUTION\n"
-            f"{cand.attribution}\n"
-            "This clip is an excerpt reused under the terms of that licence."
+            f"Story source: {story.source}\n{story.link}\n\n"
+            "Narration and script are original. Stock footage via Pexels."
         )[:4900]
 
 
@@ -1281,110 +1147,89 @@ class YouTubeUploader:
 # ---------------------------------------------------------------------------
 
 
-def build_clip(cfg: Config, workdir: Path, state: State) -> tuple[Path, ClipPlan, Candidate]:
-    """Walk candidates until one of them yields a finished vertical clip."""
-    cookie_file = write_cookie_file(cfg, workdir)
-    source = YouTubeSource(cfg)
-    transcripts = TranscriptFetcher(cfg, cookie_file)
-    planner = GeminiPlanner(cfg)
-    downloader = SegmentDownloader(cfg, workdir, cookie_file)
-    renderer = VerticalRenderer(cfg)
+def produce(cfg: Config, workdir: Path, state: State) -> tuple[Path, VideoScript, Story]:
+    news = NewsSource(cfg)
+    writer = ScriptWriter(cfg)
+    narrator = Narrator(cfg)
+    captions = CaptionBuilder()
+    footage = FootageFetcher(cfg, workdir)
+    assembler = VideoAssembler(cfg, workdir)
 
-    candidates = source.find_candidates()
-    fresh = [c for c in candidates if not state.seen(c.video_id)]
+    stories = news.collect()
+    fresh = [s for s in stories if not state.seen(s.key)]
     if not fresh:
-        raise NoCandidateError(
-            "Every candidate found today has already been used. "
-            "Widen SEARCH_QUERIES or raise MAX_CANDIDATES."
+        raise NoStoryError(
+            "Every story in the feeds has already been covered. "
+            "Add more feeds to RSS_FEEDS or raise MAX_STORIES."
         )
+    log.info("%d story/stories not yet covered.", len(fresh))
 
-    last_error: Exception | None = None
     tally: dict[str, int] = {}
-    for index, cand in enumerate(fresh, start=1):
+    last_error: Exception | None = None
+
+    for index, story in enumerate(fresh[:6], start=1):
         log.info("-" * 70)
-        log.info("Candidate %d/%d: %s - %s (%s, %s views)",
-                 index, len(fresh), cand.channel, cand.title,
-                 hhmmss(cand.duration_s), f"{cand.view_count:,}")
+        log.info("Story %d: %s", index, story.title)
+        log.info("         %s | %.0fh old", story.source, story.age_hours)
         try:
-            cues = transcripts.fetch(cand.video_id)
-            plan = planner.plan(cand, cues)
-            raw = downloader.download(cand, plan)
-            dest = cfg.output_dir / f"{sanitize_filename(plan.title)}_{cand.video_id}.mp4"
-            final = renderer.render(raw, dest, plan)
-            state.mark(cand.video_id)
-            return final, plan, cand
-        except (TranscriptError, GeminiError, DownloadError, RenderError) as exc:
+            script = writer.write(story)
+
+            audio, words = narrator.speak(script.narration, workdir / "voice.mp3")
+            seconds = assembler.duration(audio)
+            if seconds < 12:
+                raise NarrationError(f"Narration is only {seconds:.1f}s - too short.")
+            seconds = min(seconds + 0.4, cfg.max_seconds)
+            log.info("Narration length: %.1fs", seconds)
+
+            ass = captions.write(words, workdir / "captions.ass")
+            clips = footage.fetch(script.broll, needed=max(3, int(seconds // 6)))
+            background = assembler.build_background(clips, seconds)
+
+            dest = cfg.output_dir / f"{sanitize_filename(script.title)}_{story.key}.mp4"
+            final = assembler.assemble(background, audio, ass, dest)
+
+            state.mark(story.key)
+            return final, script, story
+
+        except (ScriptError, NarrationError, FootageError, RenderError) as exc:
             label = type(exc).__name__.replace("Error", "").lower()
             tally[label] = tally.get(label, 0) + 1
-            log.warning("Candidate %s skipped (%s): %s", cand.video_id, label, exc)
+            log.warning("Story skipped (%s): %s", label, str(exc)[:220])
             last_error = exc
-
-            # Only blacklist a video when the problem is permanent (it genuinely
-            # has no captions). A network block or rate limit is temporary, and
-            # blacklisting on those would silently burn the whole candidate pool
-            # during an outage.
-            permanent = True
-            if isinstance(exc, TranscriptError):
-                permanent = "no-captions" in transcripts.last_reason
-            if permanent:
-                state.mark(cand.video_id)
-            else:
-                log.info("Not blacklisting %s - looks like a temporary block.",
-                         cand.video_id)
-
-            for leftover in workdir.glob("raw.*"):
-                leftover.unlink(missing_ok=True)
+            # Script failures are about this story; keep it out of the pool.
+            if isinstance(exc, ScriptError):
+                state.mark(story.key)
+            for junk in list(workdir.glob("seg_*.mp4")) + list(workdir.glob("stock_*.mp4")):
+                junk.unlink(missing_ok=True)
             continue
 
-    breakdown = ", ".join(f"{n}x {k}" for k, n in sorted(tally.items()))
-    hint = ""
-    if tally.get("transcript", 0) >= max(3, len(fresh) // 2):
-        hint = (
-            " Most failures were transcript fetches, which usually means YouTube is "
-            "blocking this datacenter IP. Adding the YT_COOKIES secret normally fixes it "
-            "- see the README."
-        )
-    raise NoCandidateError(
-        f"All {len(fresh)} candidates failed ({breakdown}). Last error: {last_error}.{hint}"
-    )
-
-
-def distribute(cfg: Config, video: Path, plan: ClipPlan, cand: Candidate) -> dict[str, Any]:
-    results: dict[str, Any] = {"youtube": None, "errors": []}
-
-    try:
-        results["youtube"] = YouTubeUploader(cfg).upload(video, plan, cand)
-    except UploadError as exc:
-        log.error("YouTube upload failed: %s", exc)
-        results["errors"].append(f"youtube: {exc}")
-
-    return results
+    breakdown = ", ".join(f"{n}x {k}" for k, n in sorted(tally.items())) or "none"
+    raise NoStoryError(f"Could not produce a video ({breakdown}). Last error: {last_error}")
 
 
 def write_summary(payload: dict[str, Any]) -> None:
-    """Write a human-readable run summary into the GitHub Actions job page."""
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not path:
         return
     try:
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write("## Shorts Factory run\n\n")
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write("## Shorts Factory run\n\n")
             for key, value in payload.items():
-                fh.write(f"- **{key}**: {value}\n")
-            fh.write("\n")
+                handle.write(f"- **{key}**: {value}\n")
+            handle.write("\n")
     except OSError:
         pass
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Automated faceless Shorts factory.")
+    parser = argparse.ArgumentParser(description="Automated original-content Shorts factory.")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Build the clip but do not upload anywhere.")
+                        help="Build the video but do not upload it.")
     parser.add_argument("--keep-temp", action="store_true",
                         help="Do not delete the temporary working directory.")
     args = parser.parse_args()
 
-    start_time = time.time()
+    started = time.time()
     try:
         cfg = Config.from_env(dry_run=args.dry_run)
     except ConfigError as exc:
@@ -1392,7 +1237,7 @@ def main() -> int:
         return 2
 
     slot = os.environ.get("POST_SLOT", "manual")
-    log.info("=== Shorts Factory | posting slot: %s ===", slot)
+    log.info("=== Shorts Factory | slot: %s ===", slot)
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     state = State(cfg.state_file)
@@ -1401,51 +1246,50 @@ def main() -> int:
 
     exit_code = 0
     try:
-        video, plan, cand = build_clip(cfg, workdir, state)
+        video, script, story = produce(cfg, workdir, state)
 
         if args.dry_run:
-            log.info("DRY RUN - skipping uploads. Clip is at %s", video)
-            write_summary(
-                {"slot": slot, "mode": "dry-run", "clip": str(video), "title": plan.title}
-            )
+            log.info("DRY RUN - not uploading. Video is at %s", video)
+            write_summary({"slot": slot, "mode": "dry-run", "title": script.title,
+                           "story": story.title, "words": script.word_count,
+                           "file": video.name})
         else:
-            results = distribute(cfg, video, plan, cand)
-            write_summary(
-                {
+            try:
+                video_id = YouTubeUploader(cfg).upload(video, script, story)
+                write_summary({
                     "slot": slot,
-                    "source": f"{cand.title} ({cand.channel})",
-                    "segment": f"{hhmmss(plan.start)} - {hhmmss(plan.end)}",
-                    "title": plan.title,
-                    "youtube": (
-                        f"https://youtube.com/shorts/{results['youtube']}"
-                        if results["youtube"] else "not uploaded"
-                    ),
-                    "errors": "; ".join(results["errors"]) or "none",
-                }
-            )
-            if results["errors"] and not results["youtube"]:
+                    "story": f"{story.title} ({story.source})",
+                    "title": script.title,
+                    "words": script.word_count,
+                    "youtube": f"https://youtube.com/shorts/{video_id}",
+                })
+            except UploadError as exc:
+                log.error("Upload failed: %s", exc)
+                write_summary({"slot": slot, "title": script.title,
+                               "result": "render ok, upload failed", "detail": str(exc)[:400]})
                 exit_code = 1
 
-    except NoCandidateError as exc:
-        log.warning("Nothing to post today: %s", exc)
-        write_summary({"result": "no candidate", "detail": str(exc)})
-        exit_code = 0  # an empty day is not a build failure
+    except NoStoryError as exc:
+        log.warning("Nothing posted this run: %s", exc)
+        write_summary({"slot": slot, "result": "no story", "detail": str(exc)[:500]})
+        exit_code = 0   # a quiet slot is not a build failure
     except ConfigError as exc:
         log.error("Configuration problem: %s", exc)
+        write_summary({"slot": slot, "result": "config error", "detail": str(exc)[:500]})
         exit_code = 2
     except PipelineError as exc:
         log.error("Pipeline failure: %s", exc)
-        write_summary({"result": "failed", "detail": str(exc)})
+        write_summary({"slot": slot, "result": "failed", "detail": str(exc)[:500]})
         exit_code = 1
-    except Exception as exc:  # last-resort net so state still gets saved
+    except Exception as exc:
         log.exception("Unexpected error: %s", exc)
-        write_summary({"result": "crashed", "detail": str(exc)})
+        write_summary({"slot": slot, "result": "crashed", "detail": str(exc)[:500]})
         exit_code = 1
     finally:
         state.save()
         if not args.keep_temp:
             shutil.rmtree(workdir, ignore_errors=True)
-        log.info("Finished in %.1fs (exit=%d).", time.time() - start_time, exit_code)
+        log.info("Finished in %.1fs (exit=%d).", time.time() - started, exit_code)
 
     return exit_code
 
