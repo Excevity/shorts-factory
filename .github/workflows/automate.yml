@@ -6,14 +6,16 @@ on:
   # 15:00 / 17:00 / 19:00 UTC; in summer (EDT) they are 14:00 / 16:00 / 18:00 UTC.
   # So we fire at all six hours and let the guard step below cancel the three
   # that are not actually a target hour in New York today.
-  # Two things to know about GitHub's free scheduler:
-  #  1. It is busiest exactly on the hour, so runs at :00 are the most likely
-  #     to be delayed by an hour or dropped entirely. We use :07 and :37.
-  #  2. It drops runs anyway. So each posting slot gets TWO attempts, 30
-  #     minutes apart. main.py records which slot already posted today and
-  #     exits immediately on the backup attempt, so you never get doubles.
+  # GitHub's free scheduler is best-effort: runs are routinely 30-90 minutes
+  # late and are sometimes dropped entirely. It is also busiest exactly on the
+  # hour, so we avoid :00.
+  #
+  # We therefore wake up every 30 minutes across a wide UTC window and let
+  # main.py decide what to do. It works out which New York posting slot the run
+  # belongs to (accepting late arrivals), and records which slots already
+  # posted today, so extra wake-ups cost about 20 seconds and never double-post.
   schedule:
-    - cron: "7,37 14,15,16,17,18,19 * * *"
+    - cron: "9,39 13,14,15,16,17,18,19,20,21 * * *"
 
   # Lets you press a "Run workflow" button manually in the Actions tab.
   workflow_dispatch:
@@ -44,8 +46,10 @@ jobs:
 
     steps:
       # ---------------------------------------------------------------
-      # 0. Only continue if it is 10 AM, 12 PM or 2 PM in New York.
-      #    (Skipped entirely when you click "Run workflow" yourself.)
+      # 0. Cheap early exit. This is deliberately a WIDE window: main.py
+      #    makes the precise decision, because only it can see which slots
+      #    have already posted today. Keeping this loose is what lets a
+      #    run that GitHub delivered an hour late still count.
       # ---------------------------------------------------------------
       - name: Check New York local time
         id: clock
@@ -54,17 +58,19 @@ jobs:
           echo "New York local time is ${HOUR}:00"
           if [ "${{ github.event_name }}" != "schedule" ]; then
             echo "Manual run - going ahead regardless of the clock."
-            echo "run=true"  >> "$GITHUB_OUTPUT"
+            echo "run=true" >> "$GITHUB_OUTPUT"
             echo "slot=manual" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          case "$HOUR" in
-            10) echo "run=true"  >> "$GITHUB_OUTPUT"; echo "slot=10am" >> "$GITHUB_OUTPUT" ;;
-            12) echo "run=true"  >> "$GITHUB_OUTPUT"; echo "slot=12pm" >> "$GITHUB_OUTPUT" ;;
-            14) echo "run=true"  >> "$GITHUB_OUTPUT"; echo "slot=2pm"  >> "$GITHUB_OUTPUT" ;;
-            *)  echo "run=false" >> "$GITHUB_OUTPUT"
-                echo "Not a posting slot - this is the daylight-saving twin. Skipping." ;;
-          esac
+          # Anything from 9am to 5pm New York is worth waking up for; main.py
+          # sorts out which slot (if any) this run actually belongs to.
+          if [ "$HOUR" -ge 9 ] && [ "$HOUR" -le 17 ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "slot=scheduled" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Outside the posting window entirely - skipping."
+          fi
 
       - name: Checkout repository
         if: steps.clock.outputs.run == 'true'
