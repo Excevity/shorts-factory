@@ -608,6 +608,7 @@ class GeminiPlanner:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.session = requests.Session()
+        self._auth_mode: str | None = None
 
     def plan(self, cand: Candidate, cues: list[TranscriptCue]) -> ClipPlan:
         prompt = PROMPT_TEMPLATE.format(
@@ -621,6 +622,26 @@ class GeminiPlanner:
         plan = self._parse(raw)
         return self._validate(plan, cues)
 
+    # Google is midway through changing its API key format. Old keys start with
+    # "AIza" and work as a ?key= query parameter. New keys start with "AQ." and
+    # are rejected that way (401 ACCESS_TOKEN_TYPE_UNSUPPORTED) - they need a
+    # header instead. We try each style until one works, then remember it.
+    AUTH_MODES = ("header", "bearer", "query")
+
+    def _send(self, url: str, payload: dict[str, Any], mode: str) -> requests.Response:
+        headers: dict[str, str] = {}
+        params: dict[str, str] = {}
+        key = self.cfg.gemini_api_key
+        if mode == "header":
+            headers["x-goog-api-key"] = key
+        elif mode == "bearer":
+            headers["Authorization"] = f"Bearer {key}"
+        else:
+            params["key"] = key
+        return self.session.post(
+            url, params=params, headers=headers, json=payload, timeout=120
+        )
+
     @retry(times=4, delay=8.0, exceptions=(requests.RequestException, GeminiError))
     def _generate(self, prompt: str) -> str:
         url = f"{self.BASE}/{self.cfg.gemini_model}:generateContent"
@@ -632,12 +653,38 @@ class GeminiPlanner:
                 "responseMimeType": "application/json",
             },
         }
-        resp = self.session.post(
-            url,
-            params={"key": self.cfg.gemini_api_key},
-            json=payload,
-            timeout=120,
-        )
+
+        # If we already know which auth style this key likes, go straight to it.
+        modes = (self._auth_mode,) if self._auth_mode else self.AUTH_MODES
+        resp = None
+        rejected: list[str] = []
+
+        for mode in modes:
+            resp = self._send(url, payload, mode)
+            if resp.status_code in (401, 403) and not self._auth_mode:
+                rejected.append(f"{mode}={resp.status_code}")
+                log.info("Gemini rejected the %s auth style - trying the next one.", mode)
+                continue
+            if resp.status_code < 400:
+                if self._auth_mode != mode:
+                    log.info("Gemini accepted the '%s' auth style.", mode)
+                self._auth_mode = mode
+            break
+
+        if resp is None:  # pragma: no cover - defensive
+            raise GeminiError("Gemini request was never sent.")
+
+        if resp.status_code in (401, 403):
+            # A rejected key is never a temporary glitch, so raise ConfigError
+            # rather than GeminiError: that skips the retries AND stops the whole
+            # run instead of burning through every candidate with a dead key.
+            raise ConfigError(
+                f"Gemini rejected your API key with every auth style ({', '.join(rejected)}). "
+                f"Key starts with '{self.cfg.gemini_api_key[:4]}'. "
+                "If it starts with 'AQ.', create a replacement key from the Google Cloud "
+                "Console instead of AI Studio (see the README) - those come out in the "
+                f"older 'AIza' format. Server said: {resp.text[:300]}"
+            )
         if resp.status_code == 429:
             raise GeminiError("Gemini free-tier rate limit hit (429).")
         if resp.status_code >= 400:
