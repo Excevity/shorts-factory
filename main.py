@@ -166,6 +166,8 @@ class Config:
     google_voice: str = "en-US-Chirp3-HD-Charon"
     # Background is deliberately hypnotic filler; cutaways carry the meaning.
     background_queries: list[str] = field(default_factory=list)
+    # Words in a Pexels clip's URL slug that mean "this is about a person".
+    footage_blocklist: list[str] = field(default_factory=list)
     upload_privacy: str = "private"
     # Tried in order. If one is rate limited or retired, the next is used.
     gemini_models: list[str] = field(default_factory=list)
@@ -216,11 +218,25 @@ class Config:
             background_queries=[
                 q.strip() for q in (
                     _env("BACKGROUND_QUERIES",
-                         "oddly satisfying,kinetic sand cutting,marble run,soap cutting,"
-                         "slime mixing,paint mixing,domino chain reaction,hydraulic press,"
-                         "sand art,water beads")
+                         "marble run,domino chain reaction,soap cutting,kinetic sand cutting,"
+                         "pencil sharpening,wood carving,hydraulic press crushing,"
+                         "paint mixing,slime stretching,laser cutting metal,"
+                         "3d printer printing,glass blowing,sand falling,water beads,"
+                         "chocolate pouring,lathe woodturning")
                     or ""
                 ).split(",") if q.strip()
+            ],
+            footage_blocklist=[
+                w.strip().lower() for w in (
+                    _env("FOOTAGE_BLOCKLIST",
+                         # What someone is DOING - not 'person' or 'hands', so
+                         # 'person carving a pencil' still gets through.
+                         "eating,drinking,smiling,posing,portrait,model,dancing,selfie,"
+                         "couple,family,child,kid,baby,face,makeup,fashion,yoga,workout,"
+                         "talking,laughing,walking,sitting,girl,woman,boy,man,teenager,"
+                         "beach,party,office,meeting,phone,laptop")
+                    or ""
+                ).split(",") if w.strip()
             ],
             upload_privacy=privacy,
             gemini_models=[
@@ -1209,6 +1225,26 @@ class FootageFetcher:
         self.workdir = workdir
         self._used: set[int] = set()
 
+    def _acceptable(self, video: dict[str, Any]) -> bool:
+        """Reject people-centric clips using the Pexels URL slug.
+
+        Pexels names every clip descriptively, e.g.
+        /video/a-woman-eating-chips-12345/. That slug is a free content
+        description, so we can drop 'girl eating snacks' before downloading it
+        while keeping 'person carving a pencil' - the blocklist targets what
+        someone is DOING, not the mere presence of hands.
+        """
+        slug = str(video.get("url") or "").lower()
+        if not slug:
+            return True
+        words = set(re.split(r"[^a-z]+", slug))
+        blocked = words & set(self.cfg.footage_blocklist)
+        if blocked:
+            log.info("  skipping clip (%s): %s", ", ".join(sorted(blocked)),
+                     slug.rstrip("/").split("/")[-1][:60])
+            return False
+        return True
+
     def fetch_one(self, query: str, tag: str) -> Path | None:
         """Grab a single clip for a keyword cutaway."""
         if not self.cfg.pexels_api_key:
@@ -1229,6 +1265,8 @@ class FootageFetcher:
         for video in videos:
             vid = video.get("id")
             if vid in self._used or (video.get("duration") or 0) < 3:
+                continue
+            if not self._acceptable(video):
                 continue
             best = self._best_file(video.get("video_files") or [])
             if not best:
@@ -1273,6 +1311,8 @@ class FootageFetcher:
                     break
                 vid = video.get("id")
                 if vid in seen_ids or (video.get("duration") or 0) < 4:
+                    continue
+                if not self._acceptable(video):
                     continue
                 best = self._best_file(video.get("video_files") or [])
                 if not best:
