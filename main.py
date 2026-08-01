@@ -157,9 +157,11 @@ class Config:
     max_stories: int = 25
     target_seconds: int = 50
     max_seconds: int = 59
-    voice: str = "en-US-AndrewMultilingualNeural"
-    fallback_voice: str = "en-US-GuyNeural"
-    speech_rate: str = "+10%"
+    # Brian Multilingual is the most conversational of Edge's free voices.
+    # Andrew is accurate but flat; Ava is the most expressive alternative.
+    voice: str = "en-US-BrianMultilingualNeural"
+    fallback_voice: str = "en-US-AvaMultilingualNeural"
+    speech_rate: str = "+12%"
     google_tts_api_key: str | None = None
     google_voice: str = "en-US-Chirp3-HD-Charon"
     # Background is deliberately hypnotic filler; cutaways carry the meaning.
@@ -203,10 +205,11 @@ class Config:
             max_stories=_int("MAX_STORIES", 25),
             target_seconds=_int("TARGET_SECONDS", 50),
             max_seconds=_int("MAX_SECONDS", 59),
-            voice=(_env("TTS_VOICE", "en-US-AndrewMultilingualNeural")
-                   or "en-US-AndrewMultilingualNeural"),
-            fallback_voice=_env("TTS_FALLBACK_VOICE", "en-US-GuyNeural") or "en-US-GuyNeural",
-            speech_rate=_env("TTS_RATE", "+10%") or "+10%",
+            voice=(_env("TTS_VOICE", "en-US-BrianMultilingualNeural")
+                   or "en-US-BrianMultilingualNeural"),
+            fallback_voice=(_env("TTS_FALLBACK_VOICE", "en-US-AvaMultilingualNeural")
+                            or "en-US-AvaMultilingualNeural"),
+            speech_rate=_env("TTS_RATE", "+12%") or "+12%",
             google_tts_api_key=_env("GOOGLE_TTS_API_KEY"),
             google_voice=(_env("GOOGLE_TTS_VOICE", "en-US-Chirp3-HD-Charon")
                           or "en-US-Chirp3-HD-Charon"),
