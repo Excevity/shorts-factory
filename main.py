@@ -157,9 +157,13 @@ class Config:
     max_stories: int = 25
     target_seconds: int = 50
     max_seconds: int = 59
-    voice: str = "en-US-AndrewNeural"
+    voice: str = "en-US-AndrewMultilingualNeural"
     fallback_voice: str = "en-US-GuyNeural"
-    speech_rate: str = "+8%"
+    speech_rate: str = "+10%"
+    google_tts_api_key: str | None = None
+    google_voice: str = "en-US-Chirp3-HD-Charon"
+    # Background is deliberately hypnotic filler; cutaways carry the meaning.
+    background_queries: list[str] = field(default_factory=list)
     upload_privacy: str = "private"
     # Tried in order. If one is rate limited or retired, the next is used.
     gemini_models: list[str] = field(default_factory=list)
@@ -199,9 +203,22 @@ class Config:
             max_stories=_int("MAX_STORIES", 25),
             target_seconds=_int("TARGET_SECONDS", 50),
             max_seconds=_int("MAX_SECONDS", 59),
-            voice=_env("TTS_VOICE", "en-US-AndrewNeural") or "en-US-AndrewNeural",
+            voice=(_env("TTS_VOICE", "en-US-AndrewMultilingualNeural")
+                   or "en-US-AndrewMultilingualNeural"),
             fallback_voice=_env("TTS_FALLBACK_VOICE", "en-US-GuyNeural") or "en-US-GuyNeural",
-            speech_rate=_env("TTS_RATE", "+8%") or "+8%",
+            speech_rate=_env("TTS_RATE", "+10%") or "+10%",
+            google_tts_api_key=_env("GOOGLE_TTS_API_KEY"),
+            google_voice=(_env("GOOGLE_TTS_VOICE", "en-US-Chirp3-HD-Charon")
+                          or "en-US-Chirp3-HD-Charon"),
+            background_queries=[
+                q.strip() for q in (
+                    _env("BACKGROUND_QUERIES",
+                         "oddly satisfying,kinetic sand cutting,marble run,soap cutting,"
+                         "slime mixing,paint mixing,domino chain reaction,hydraulic press,"
+                         "sand art,water beads")
+                    or ""
+                ).split(",") if q.strip()
+            ],
             upload_privacy=privacy,
             gemini_models=[
                 m.strip() for m in (
@@ -438,12 +455,21 @@ class NewsSource:
 
 
 @dataclass
+class Cutaway:
+    phrase: str
+    query: str
+    start: float = 0.0
+    end: float = 0.0
+    clip: Path | None = None
+
+
+@dataclass
 class VideoScript:
     narration: str
     title: str
     description: str
     hashtags: list[str]
-    broll: list[str]
+    cutaways: list[Cutaway] = field(default_factory=list)
 
     @property
     def word_count(self) -> int:
@@ -471,14 +497,20 @@ Also produce:
 - `title`: under 80 characters, hooky, at most one emoji.
 - `description`: 1-2 sentences.
 - `hashtags`: 4-6 lowercase tags, no '#' symbol.
-- `broll`: 5 short visual search phrases for stock footage that match the topic
-  (e.g. "gaming setup rgb", "person playing console", "server room"). Generic
-  and visual - these are searched against a stock video library, so avoid
-  proper nouns and brand names, which return nothing.
+- `cutaways`: 3 or 4 objects. Each marks a moment where the video should cut
+  from the background to a relevant visual. Each object has:
+    * `phrase`: 2-4 words copied EXACTLY as they appear in your narration.
+      They must be a literal substring of the narration, or the cut is skipped.
+      Pick the most visually concrete moments.
+    * `query`: a short, generic stock-footage search for that moment
+      (e.g. "gaming setup rgb", "server room", "person counting money").
+      No proper nouns or brand names - a stock library returns nothing for
+      "Palworld" but plenty for "trading cards".
+  Spread them across the script; do not cluster them all at the start.
 
 Return ONLY raw JSON, no markdown fences, exactly this shape:
 {{"narration": "", "title": "", "description": "", "hashtags": ["",""],
-  "broll": ["",""]}}
+  "cutaways": [{{"phrase": "", "query": ""}}]}}
 
 STORY TITLE: {title}
 SOURCE: {source}
@@ -767,7 +799,7 @@ class ScriptWriter:
             "title": field("title"),
             "description": field("description"),
             "hashtags": array("hashtags"),
-            "broll": array("broll"),
+            "cutaways": [],   # nice-to-have; the video works fine without them
         }
 
     @classmethod
@@ -796,12 +828,20 @@ class ScriptWriter:
 
         tags = [re.sub(r"[^a-z0-9]", "", t.lower()) for t in as_list(obj.get("hashtags"), 6)]
 
+        cutaways: list[Cutaway] = []
+        for item in (obj.get("cutaways") or [])[:5]:
+            if isinstance(item, dict):
+                phrase = str(item.get("phrase") or "").strip()
+                query = str(item.get("query") or "").strip()
+                if phrase and query:
+                    cutaways.append(Cutaway(phrase=phrase, query=query))
+
         return VideoScript(
             narration=str(obj.get("narration") or "").strip(),
             title=str(obj.get("title") or "").strip()[:95],
             description=str(obj.get("description") or "").strip()[:400],
             hashtags=[t for t in tags if t] or ["gaming", "tech", "shorts"],
-            broll=as_list(obj.get("broll"), 6),
+            cutaways=cutaways,
         )
 
     def _validate(self, script: VideoScript) -> VideoScript:
@@ -832,8 +872,15 @@ class ScriptWriter:
         script.narration = narration
         if not script.title:
             script.title = " ".join(narration.split()[:9])
-        if not script.broll:
-            script.broll = ["video game controller", "gaming setup", "computer screen code"]
+
+        # A cutaway is only usable if its phrase actually appears in the final
+        # narration - the trim above may have removed the tail it referred to.
+        lowered = narration.lower()
+        kept = [c for c in script.cutaways if c.phrase.lower() in lowered]
+        if len(kept) != len(script.cutaways):
+            log.info("Dropped %d cutaway(s) whose phrase is not in the narration.",
+                     len(script.cutaways) - len(kept))
+        script.cutaways = kept
 
         log.info("Script: %d words (~%.0fs) | %s",
                  script.word_count, script.word_count / self.WORDS_PER_SECOND, script.title)
@@ -852,17 +899,126 @@ class SpokenWord:
     end: float
 
 
-class Narrator:
-    """Edge TTS gives us audio AND word-level timings in one pass.
+def estimate_timings(text: str, duration: float) -> list[SpokenWord]:
+    """Work out when each word is spoken, without any speech recognition.
 
-    Those timings are what make burned-in captions possible without running any
-    speech recognition - we already know exactly when each word is spoken.
+    Needed because the best voices (Google's Chirp3-HD) do not return word
+    timings - they do not even accept SSML marks. We spread the words across
+    the known audio length, weighting by word length and adding a beat for
+    punctuation, which is what actually makes speech uneven.
+
+    Also acts as a safety net for Edge TTS: if it returns audio but no word
+    boundaries, captions still work instead of silently disappearing.
     """
+    words = [w for w in re.split(r"\s+", text.strip()) if w]
+    if not words or duration <= 0:
+        return []
+
+    weights: list[float] = []
+    for word in words:
+        letters = len(re.sub(r"[^\w]", "", word)) or 1
+        weight = 1.0 + letters * 0.85
+        if word.endswith((",", ";", ":")):
+            weight += 2.5
+        elif word.endswith((".", "!", "?")):
+            weight += 5.0
+        weights.append(weight)
+
+    total = sum(weights) or 1.0
+    out: list[SpokenWord] = []
+    clock = 0.0
+    for word, weight in zip(words, weights):
+        span = duration * (weight / total)
+        # Leave a sliver of gap so consecutive captions do not visually merge.
+        out.append(SpokenWord(word, clock, clock + span * 0.94))
+        clock += span
+    return out
+
+
+class Narrator:
+    """Turns the script into speech.
+
+    Two engines, best first:
+      1. Google Cloud TTS Chirp3-HD - near-human, 1M free characters/month.
+         Needs GOOGLE_TTS_API_KEY. No word timings, so we estimate them.
+      2. Microsoft Edge TTS - free, no key, more robotic. Returns real word
+         timings, which we use when available.
+    """
+
+    GOOGLE_URL = "https://texttospeech.googleapis.com/v1/text:synthesize"
 
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
 
-    def speak(self, text: str, dest: Path) -> tuple[Path, list[SpokenWord]]:
+    def speak(self, text: str, dest: Path,
+              probe_duration=None) -> tuple[Path, list[SpokenWord]]:
+        errors: list[str] = []
+
+        if self.cfg.google_tts_api_key:
+            try:
+                self._google(text, dest)
+                seconds = probe_duration(dest) if probe_duration else 0.0
+                words = estimate_timings(text, seconds) if seconds else []
+                log.info("Narration by Google %s (%.1f KB, %.1fs, %d estimated timings).",
+                         self.cfg.google_voice, dest.stat().st_size / 1024,
+                         seconds, len(words))
+                return dest, words
+            except Exception as exc:
+                errors.append(f"google: {str(exc)[:200]}")
+                log.warning("Google TTS failed, falling back to Edge: %s", str(exc)[:200])
+
+        try:
+            words = self._edge(text, dest)
+        except Exception as exc:
+            errors.append(f"edge: {str(exc)[:200]}")
+            raise NarrationError(
+                "Text-to-speech failed on every engine. " + " | ".join(errors)
+            ) from exc
+
+        if not words:
+            seconds = probe_duration(dest) if probe_duration else 0.0
+            words = estimate_timings(text, seconds) if seconds else []
+            log.warning("Edge returned no word boundaries - estimated %d timings instead.",
+                        len(words))
+        return dest, words
+
+    # -- engine 1: Google Cloud TTS ----------------------------------------
+
+    def _google(self, text: str, dest: Path) -> None:
+        voice = self.cfg.google_voice
+        payload = {
+            "input": {"text": text},
+            "voice": {
+                "languageCode": "-".join(voice.split("-")[:2]) or "en-US",
+                "name": voice,
+            },
+            # Chirp3-HD rejects speakingRate/pitch, so we only set the format.
+            "audioConfig": {"audioEncoding": "MP3"},
+        }
+        resp = requests.post(
+            self.GOOGLE_URL,
+            params={"key": self.cfg.google_tts_api_key},
+            json=payload, timeout=120,
+        )
+        if resp.status_code >= 400:
+            try:
+                message = (resp.json().get("error") or {}).get("message", "")[:250]
+            except ValueError:
+                message = resp.text[:250]
+            raise NarrationError(f"HTTP {resp.status_code}: {message}")
+
+        import base64
+
+        audio = (resp.json() or {}).get("audioContent")
+        if not audio:
+            raise NarrationError("Google TTS returned no audio.")
+        dest.write_bytes(base64.b64decode(audio))
+        if dest.stat().st_size < 8_000:
+            raise NarrationError("Google TTS returned a suspiciously tiny file.")
+
+    # -- engine 2: Microsoft Edge TTS --------------------------------------
+
+    def _edge(self, text: str, dest: Path) -> list[SpokenWord]:
         try:
             import edge_tts  # type: ignore  # noqa: F401
         except ImportError as exc:  # pragma: no cover
@@ -872,25 +1028,20 @@ class Narrator:
         for voice in (self.cfg.voice, self.cfg.fallback_voice):
             for attempt in (1, 2):
                 try:
-                    words = asyncio.run(self._synth(text, voice, dest))
+                    words = asyncio.run(self._edge_synth(text, voice, dest))
                     if dest.exists() and dest.stat().st_size > 8_000:
-                        log.info("Narration OK with %s (%.1f KB, %d word timings).",
+                        log.info("Narration by Edge %s (%.1f KB, %d word timings).",
                                  voice, dest.stat().st_size / 1024, len(words))
-                        return dest, words
+                        return words
                     last = NarrationError(f"{voice} produced an empty audio file.")
                 except Exception as exc:
                     last = exc
-                    log.warning("TTS attempt %d with %s failed: %s",
+                    log.warning("Edge TTS attempt %d with %s failed: %s",
                                 attempt, voice, str(exc)[:160])
                 time.sleep(3 * attempt)
+        raise NarrationError(f"Edge TTS failed for every voice. Last error: {last}")
 
-        raise NarrationError(
-            f"Text-to-speech failed for every voice. Last error: {last}. "
-            "Edge's free TTS service occasionally rate-limits; the next run "
-            "usually succeeds."
-        )
-
-    async def _synth(self, text: str, voice: str, dest: Path) -> list[SpokenWord]:
+    async def _edge_synth(self, text: str, voice: str, dest: Path) -> list[SpokenWord]:
         import edge_tts  # type: ignore
 
         communicate = edge_tts.Communicate(text, voice, rate=self.cfg.speech_rate)
@@ -937,7 +1088,7 @@ class CaptionBuilder:
         Style: Pop,{font},78,&H00FFFFFF,&H00FFFFFF,&H00101010,&H90000000,-1,0,0,0,100,100,0,0,1,7,3,2,70,70,560,1
 
         [Events]
-        Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Encoding, Text
+        Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         """)
 
     def __init__(self, font: str = "DejaVu Sans") -> None:
@@ -1004,12 +1155,87 @@ class CaptionBuilder:
 # ---------------------------------------------------------------------------
 
 
+def locate_cutaways(cutaways: list[Cutaway], words: list[SpokenWord],
+                    total: float, hold: float = 3.0) -> list[Cutaway]:
+    """Find when each cutaway phrase is spoken, using the word timings.
+
+    Matching is done on a normalised word sequence so punctuation and casing
+    do not break it. Overlapping cutaways are dropped rather than stacked.
+    """
+    if not words or not cutaways:
+        return []
+
+    def norm(text: str) -> list[str]:
+        return [re.sub(r"[^a-z0-9]", "", w.lower())
+                for w in text.split() if re.sub(r"[^a-z0-9]", "", w.lower())]
+
+    spoken = [re.sub(r"[^a-z0-9]", "", w.text.lower()) for w in words]
+    placed: list[Cutaway] = []
+
+    for cut in cutaways:
+        needle = norm(cut.phrase)
+        if not needle:
+            continue
+        for i in range(len(spoken) - len(needle) + 1):
+            if spoken[i:i + len(needle)] == needle:
+                start = max(0.0, words[i].start - 0.15)
+                end = min(total, start + hold)
+                if end - start < 1.2:
+                    break
+                # Never let two cutaways overlap.
+                if any(not (end <= p.start or start >= p.end) for p in placed):
+                    break
+                cut.start, cut.end = start, end
+                placed.append(cut)
+                break
+        else:
+            log.info("Cutaway phrase not found in the audio: %r", cut.phrase)
+
+    placed.sort(key=lambda c: c.start)
+    for cut in placed:
+        log.info("Cutaway %5.1f-%4.1fs  %-22r -> %s",
+                 cut.start, cut.end, cut.phrase, cut.query)
+    return placed
+
+
 class FootageFetcher:
     SEARCH = "https://api.pexels.com/videos/search"
 
     def __init__(self, cfg: Config, workdir: Path) -> None:
         self.cfg = cfg
         self.workdir = workdir
+        self._used: set[int] = set()
+
+    def fetch_one(self, query: str, tag: str) -> Path | None:
+        """Grab a single clip for a keyword cutaway."""
+        if not self.cfg.pexels_api_key:
+            return None
+        session = requests.Session()
+        session.headers.update({"Authorization": self.cfg.pexels_api_key})
+        try:
+            resp = session.get(self.SEARCH, timeout=30, params={
+                "query": query, "per_page": 10,
+                "orientation": "portrait", "size": "medium",
+            })
+            resp.raise_for_status()
+            videos = resp.json().get("videos") or []
+        except Exception as exc:
+            log.warning("Cutaway search failed for %r: %s", query, str(exc)[:120])
+            return None
+
+        for video in videos:
+            vid = video.get("id")
+            if vid in self._used or (video.get("duration") or 0) < 3:
+                continue
+            best = self._best_file(video.get("video_files") or [])
+            if not best:
+                continue
+            path = self.workdir / f"cut_{tag}.mp4"
+            if self._stream(best["link"], path, session):
+                self._used.add(vid)
+                return path
+        log.info("No usable cutaway footage for %r.", query)
+        return None
 
     def fetch(self, queries: list[str], needed: int) -> list[Path]:
         if not self.cfg.pexels_api_key:
@@ -1019,7 +1245,7 @@ class FootageFetcher:
         session = requests.Session()
         session.headers.update({"Authorization": self.cfg.pexels_api_key})
         clips: list[Path] = []
-        seen_ids: set[int] = set()
+        seen_ids: set[int] = self._used
 
         for query in queries:
             if len(clips) >= needed:
@@ -1073,6 +1299,9 @@ class FootageFetcher:
 
     def _download(self, url: str, index: int, session: requests.Session) -> Path | None:
         path = self.workdir / f"stock_{index:02d}.mp4"
+        return path if self._stream(url, path, session) else None
+
+    def _stream(self, url: str, path: Path, session: requests.Session) -> bool:
         try:
             with session.get(url, stream=True, timeout=120) as resp:
                 resp.raise_for_status()
@@ -1085,12 +1314,12 @@ class FootageFetcher:
                             break
             if path.stat().st_size < 40_000:
                 path.unlink(missing_ok=True)
-                return None
-            return path
+                return False
+            return True
         except Exception as exc:
             log.warning("Stock clip download failed: %s", str(exc)[:120])
             path.unlink(missing_ok=True)
-            return None
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -1230,28 +1459,76 @@ class VideoAssembler:
 
     # -- final mux ----------------------------------------------------------
 
-    def assemble(self, background: Path, narration: Path,
-                 captions: Path | None, dest: Path) -> Path:
+    def prepare_cutaways(self, cutaways: list[Cutaway]) -> list[Cutaway]:
+        """Normalise each cutaway clip to a full-screen segment of exact length."""
+        ready: list[Cutaway] = []
+        for index, cut in enumerate(cutaways):
+            if not cut.clip or not cut.clip.exists():
+                continue
+            out = self.workdir / f"cutseg_{index:02d}.mp4"
+            span = max(1.2, cut.end - cut.start)
+            chain = (
+                f"scale={self.WIDTH}:{self.HEIGHT}:force_original_aspect_ratio=increase,"
+                f"crop={self.WIDTH}:{self.HEIGHT},fps={self.FPS},setsar=1"
+            )
+            cmd = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                   "-stream_loop", "-1", "-i", str(cut.clip),
+                   "-t", f"{span:.2f}", "-an", "-vf", chain,
+                   "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+                   "-pix_fmt", "yuv420p", str(out)]
+            try:
+                self._run(cmd, f"preparing cutaway {index}", timeout=240)
+            except RenderError as exc:
+                log.warning("Skipping cutaway %d: %s", index, str(exc)[:140])
+                continue
+            # Check duration, not file size: a visually simple clip can compress
+            # to a few kilobytes and still be perfectly valid.
+            made = self.duration(out) if out.exists() else 0.0
+            if made >= min(1.0, span * 0.6):
+                cut.clip = out
+                ready.append(cut)
+            else:
+                log.warning("Cutaway %d came out %.1fs (wanted %.1fs) - skipping.",
+                            index, made, span)
+        return ready
+
+    def assemble(self, background: Path, narration: Path, captions: Path | None,
+                 dest: Path, cutaways: list[Cutaway] | None = None) -> Path:
         dest.parent.mkdir(parents=True, exist_ok=True)
         speech = self.duration(narration)
+        cutaways = cutaways or []
 
-        # A dark vignette under the captions keeps them readable on any footage.
-        filters = [
-            "[0:v]scale=%d:%d,setsar=1[base]" % (self.WIDTH, self.HEIGHT),
-            "color=c=black@0.38:s=%dx270:r=%d[shade]" % (self.WIDTH, self.FPS),
-            "[base][shade]overlay=0:H-800:shortest=1[shaded]",
-        ]
+        inputs = ["-i", str(background), "-i", str(narration)]
+        filters = ["[0:v]scale=%d:%d,setsar=1[base]" % (self.WIDTH, self.HEIGHT)]
+        last = "base"
+
+        # Full-screen cutaways: shift each clip onto the main timeline with
+        # setpts, then show it only during its window.
+        for index, cut in enumerate(cutaways):
+            stream = 2 + index          # 0 = background, 1 = narration audio
+            inputs += ["-i", str(cut.clip)]
+            filters.append(
+                f"[{stream}:v]setpts=PTS-STARTPTS+{cut.start:.3f}/TB[cut{index}]"
+            )
+            filters.append(
+                f"[{last}][cut{index}]overlay=0:0:"
+                f"enable='between(t,{cut.start:.3f},{cut.end:.3f})'[ov{index}]"
+            )
+            last = f"ov{index}"
+
+        # A dark band under the captions keeps them readable on any footage.
+        filters.append("color=c=black@0.38:s=%dx270:r=%d[shade]" % (self.WIDTH, self.FPS))
+        filters.append(f"[{last}][shade]overlay=0:H-800:shortest=1[shaded]")
         last = "shaded"
+
         if captions:
             escaped = str(captions.resolve()).replace("\\", "/").replace(":", r"\:")
             filters.append(f"[{last}]subtitles='{escaped}'[v]")
-            last = "v"
         else:
             filters.append(f"[{last}]null[v]")
-            last = "v"
 
         cmd = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-               "-i", str(background), "-i", str(narration),
+               *inputs,
                "-filter_complex", ";".join(filters),
                "-map", "[v]", "-map", "1:a",
                "-c:v", "libx264", "-preset", "medium", "-crf", "21",
@@ -1407,19 +1684,31 @@ def produce(cfg: Config, workdir: Path, state: State) -> tuple[Path, VideoScript
         try:
             script = writer.write(story)
 
-            audio, words = narrator.speak(script.narration, workdir / "voice.mp3")
+            audio, words = narrator.speak(script.narration, workdir / "voice.mp3",
+                                          probe_duration=assembler.duration)
             seconds = assembler.duration(audio)
             if seconds < 12:
                 raise NarrationError(f"Narration is only {seconds:.1f}s - too short.")
             seconds = min(seconds + 0.4, cfg.max_seconds)
             log.info("Narration length: %.1fs", seconds)
 
+            if not words:
+                words = estimate_timings(script.narration, seconds)
             ass = captions.write(words, workdir / "captions.ass")
-            clips = footage.fetch(script.broll, needed=max(3, int(seconds // 6)))
+
+            # Hypnotic filler background, then topic footage on keyword hits.
+            clips = footage.fetch(cfg.background_queries,
+                                  needed=max(3, int(seconds // 8)))
             background = assembler.build_background(clips, seconds)
 
+            placed = locate_cutaways(script.cutaways, words, seconds)
+            for index, cut in enumerate(placed):
+                cut.clip = footage.fetch_one(cut.query, f"{index:02d}")
+            placed = assembler.prepare_cutaways([c for c in placed if c.clip])
+            log.info("%d cutaway(s) ready.", len(placed))
+
             dest = cfg.output_dir / f"{sanitize_filename(script.title)}_{story.key}.mp4"
-            final = assembler.assemble(background, audio, ass, dest)
+            final = assembler.assemble(background, audio, ass, dest, cutaways=placed)
 
             state.mark(story.key)
             return final, script, story
