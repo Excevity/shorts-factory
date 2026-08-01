@@ -161,7 +161,10 @@ jobs:
           TTS_FALLBACK_VOICE: "en-US-AvaMultilingualNeural"
           # Brainrot pacing. +0% is natural, +20% is very fast.
           TTS_RATE: "+12%"
-          UPLOAD_PRIVACY: ${{ github.event.inputs.privacy || 'private' }}
+          # The value after || is what SCHEDULED runs use. The part before it
+          # only applies to manual runs, where you pick from the dropdown.
+          # Set to 'private' if you ever want to review before publishing.
+          UPLOAD_PRIVACY: ${{ github.event.inputs.privacy || 'public' }}
           # Tried in order. If one is rate limited or retired, the next is used.
           # If they all fail, the log prints exactly which models your key can use.
           GEMINI_MODELS: "gemini-2.0-flash,gemini-flash-latest,gemini-2.0-flash-lite,gemini-2.5-flash,gemini-2.5-flash-lite"
