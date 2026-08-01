@@ -142,8 +142,14 @@ jobs:
           TARGET_SECONDS: "50"
           MAX_SECONDS: "59"
           # Background is deliberately hypnotic filler that holds attention;
-          # the keyword cutaways carry the actual meaning.
-          BACKGROUND_QUERIES: "oddly satisfying,kinetic sand cutting,marble run,soap cutting,slime mixing,paint mixing,domino chain reaction,hydraulic press,sand art,water beads"
+          # the keyword cutaways carry the actual meaning. Specific object-based
+          # searches beat vague ones - "oddly satisfying" returns random people.
+          BACKGROUND_QUERIES: "marble run,domino chain reaction,soap cutting,kinetic sand cutting,pencil sharpening,wood carving,hydraulic press crushing,paint mixing,slime stretching,laser cutting metal,3d printer printing,glass blowing,sand falling,water beads,chocolate pouring,lathe woodturning"
+          # Pexels names each clip in its URL, e.g. /video/a-woman-eating-chips-123/.
+          # Any clip whose name contains one of these words is skipped before
+          # download. Targets what a person is DOING, so "person carving a
+          # pencil" and "hands shaping clay" still get through.
+          FOOTAGE_BLOCKLIST: "eating,drinking,smiling,posing,portrait,model,dancing,selfie,couple,family,child,kid,baby,face,makeup,fashion,yoga,workout,talking,laughing,walking,sitting,girl,woman,boy,man,teenager,beach,party,office,meeting,phone,laptop"
           # Only used if you ever set GOOGLE_TTS_API_KEY.
           GOOGLE_TTS_VOICE: "en-US-Chirp3-HD-Charon"
           # The actual narrator. Brian Multilingual is the most conversational
