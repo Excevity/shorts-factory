@@ -130,6 +130,10 @@ jobs:
           # --- optional: free key from pexels.com for real stock footage.
           #     Without it you still get a clean animated gradient background.
           PEXELS_API_KEY:      ${{ secrets.PEXELS_API_KEY }}
+          # --- optional: Google Cloud TTS for a far more human voice.
+          #     1M free characters/month; you use roughly 72k. Falls back to
+          #     the free Microsoft Edge voice if unset or if it errors.
+          GOOGLE_TTS_API_KEY:  ${{ secrets.GOOGLE_TTS_API_KEY }}
           # --- tuning knobs (edit these freely, they are not secret) --
           # Where stories come from. Change these to change your niche.
           RSS_FEEDS: "https://feeds.ign.com/ign/games-all,https://www.pcgamer.com/rss/,https://www.eurogamer.net/feed,https://www.rockpapershotgun.com/feed,https://www.gamespot.com/feeds/news/,https://www.polygon.com/rss/index.xml,https://www.nintendolife.com/feeds/latest,https://blog.playstation.com/feed/,https://techcrunch.com/category/artificial-intelligence/feed/,https://www.theverge.com/rss/index.xml,https://feeds.arstechnica.com/arstechnica/index"
@@ -137,8 +141,15 @@ jobs:
           MAX_STORIES: "25"
           TARGET_SECONDS: "50"
           MAX_SECONDS: "59"
-          TTS_VOICE: "en-US-AndrewNeural"
-          TTS_RATE: "+8%"
+          # Background is deliberately hypnotic filler that holds attention;
+          # the keyword cutaways carry the actual meaning.
+          BACKGROUND_QUERIES: "oddly satisfying,kinetic sand cutting,marble run,soap cutting,slime mixing,paint mixing,domino chain reaction,hydraulic press,sand art,water beads"
+          # Google voice used when GOOGLE_TTS_API_KEY is set. Other good ones:
+          # en-US-Chirp3-HD-Puck (energetic), -Kore (warm), -Fenrir (deep).
+          GOOGLE_TTS_VOICE: "en-US-Chirp3-HD-Charon"
+          # Edge fallback, used only if Google TTS is unset or fails.
+          TTS_VOICE: "en-US-AndrewMultilingualNeural"
+          TTS_RATE: "+10%"
           UPLOAD_PRIVACY: ${{ github.event.inputs.privacy || 'private' }}
           # Tried in order. If one is rate limited or retired, the next is used.
           # If they all fail, the log prints exactly which models your key can use.
