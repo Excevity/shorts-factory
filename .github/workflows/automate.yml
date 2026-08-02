@@ -15,7 +15,7 @@ on:
   # belongs to (accepting late arrivals), and records which slots already
   # posted today, so extra wake-ups cost about 20 seconds and never double-post.
   schedule:
-    - cron: "9,39 13,14,15,16,17,18,19,20,21 * * *"
+    - cron: "9,39 13,14,15,16,17,18,19,20,21,22,23,0,1 * * *"
 
   # Lets you press a "Run workflow" button manually in the Actions tab.
   workflow_dispatch:
@@ -62,9 +62,10 @@ jobs:
             echo "slot=manual" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Anything from 9am to 5pm New York is worth waking up for; main.py
-          # sorts out which slot (if any) this run actually belongs to.
-          if [ "$HOUR" -ge 9 ] && [ "$HOUR" -le 17 ]; then
+          # Anything from 9am to 8pm New York is worth waking up for; main.py
+          # decides which slot (if any) is still outstanding. The window runs
+          # late so a dropped morning run can still be caught up.
+          if [ "$HOUR" -ge 9 ] && [ "$HOUR" -le 20 ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "slot=scheduled" >> "$GITHUB_OUTPUT"
           else
@@ -130,6 +131,10 @@ jobs:
           # --- optional: free key from pexels.com for real stock footage.
           #     Without it you still get a clean animated gradient background.
           PEXELS_API_KEY:      ${{ secrets.PEXELS_API_KEY }}
+          # --- optional second footage library. Free key, no billing.
+          #     Pixabay carries more amateur/ASMR-style clips than Pexels and
+          #     exposes proper tags, so relevance filtering works better on it.
+          PIXABAY_API_KEY:     ${{ secrets.PIXABAY_API_KEY }}
           # --- optional: Google Cloud TTS. Better voice, but Google requires a
           #     billing account (card on file) even for its free tier, so this
           #     is left unset by default. Unset = the free Edge voice is used.
@@ -144,7 +149,7 @@ jobs:
           # Background is deliberately hypnotic filler that holds attention;
           # the keyword cutaways carry the actual meaning. Specific object-based
           # searches beat vague ones - "oddly satisfying" returns random people.
-          BACKGROUND_QUERIES: "marble run,domino chain reaction,soap cutting,kinetic sand cutting,pencil sharpening,wood carving,hydraulic press crushing,paint mixing,slime stretching,laser cutting metal,3d printer printing,glass blowing,sand falling,water beads,chocolate pouring,lathe woodturning"
+          BACKGROUND_QUERIES: "soap cutting,cutting soap,kinetic sand cutting,slime,asmr,pencil sharpening,wood carving,wood shaving,marble run,dominoes falling,hydraulic press,paint mixing,glass blowing,pottery wheel,lathe turning,foam cutting,ice cutting,candle making,resin pouring,chocolate pouring"
           # Pexels names each clip in its URL, e.g. /video/a-woman-eating-chips-123/.
           # Any clip whose name contains one of these words is skipped before
           # download. Targets what a person is DOING, so "person carving a
