@@ -150,6 +150,7 @@ class Config:
     yt_client_secret: str
     yt_refresh_token: str
     pexels_api_key: str | None = None       # optional - falls back to gradient
+    pixabay_api_key: str | None = None      # optional second footage library
 
     # --- tuning ------------------------------------------------------------
     feeds: list[str] = field(default_factory=list)
@@ -175,6 +176,8 @@ class Config:
     # count. GitHub's scheduler is frequently 30-90 minutes late.
     post_hours: list[int] = field(default_factory=lambda: [10, 12, 14])
     grace_minutes: int = 115
+    # Latest New York hour at which a missed earlier slot may still be caught up.
+    catch_up_until: int = 20
     state_file: Path = Path("state/processed.json")
     output_dir: Path = Path("output")
     dry_run: bool = False
@@ -202,6 +205,7 @@ class Config:
             yt_client_secret=_env("YT_CLIENT_SECRET", required=not dry_run) or "",
             yt_refresh_token=_env("YT_REFRESH_TOKEN", required=not dry_run) or "",
             pexels_api_key=_env("PEXELS_API_KEY"),
+            pixabay_api_key=_env("PIXABAY_API_KEY"),
             feeds=feeds,
             hours_back=_int("HOURS_BACK", 48),
             max_stories=_int("MAX_STORIES", 25),
@@ -251,6 +255,7 @@ class Config:
                 if h.strip().isdigit()
             ] or [10, 12, 14],
             grace_minutes=_int("GRACE_MINUTES", 115),
+            catch_up_until=_int("CATCH_UP_UNTIL", 20),
             state_file=Path(_env("STATE_FILE", "state/processed.json")
                             or "state/processed.json"),
             output_dir=Path(_env("OUTPUT_DIR", "output") or "output"),
@@ -1218,115 +1223,181 @@ def locate_cutaways(cutaways: list[Cutaway], words: list[SpokenWord],
 
 
 class FootageFetcher:
-    SEARCH = "https://api.pexels.com/videos/search"
+    """Finds background and cutaway clips.
+
+    Searches two free libraries. Neither ever returns "no results" - they both
+    fall back to loosely-related footage - so relevance is checked here rather
+    than trusted. A clean gradient beats footage that has nothing to do with
+    the search.
+    """
+
+    PEXELS = "https://api.pexels.com/videos/search"
+    PIXABAY = "https://pixabay.com/api/videos/"
 
     def __init__(self, cfg: Config, workdir: Path) -> None:
         self.cfg = cfg
         self.workdir = workdir
-        self._used: set[int] = set()
+        self._used: set[str] = set()
 
-    def _acceptable(self, video: dict[str, Any]) -> bool:
-        """Reject people-centric clips using the Pexels URL slug.
+    # -- relevance and content filtering ------------------------------------
 
-        Pexels names every clip descriptively, e.g.
-        /video/a-woman-eating-chips-12345/. That slug is a free content
-        description, so we can drop 'girl eating snacks' before downloading it
-        while keeping 'person carving a pencil' - the blocklist targets what
-        someone is DOING, not the mere presence of hands.
+    @staticmethod
+    def _words(text: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", (text or "").lower())
+
+    def _relevance(self, query: str, text: str) -> int:
+        """How many meaningful words of the query the clip actually matches.
+
+        Matched on a 4-character stem so 'cutting' still matches 'cut' and
+        'sliced'. Zero means the library gave us something unrelated.
         """
-        slug = str(video.get("url") or "").lower()
-        if not slug:
-            return True
-        words = set(re.split(r"[^a-z]+", slug))
-        blocked = words & set(self.cfg.footage_blocklist)
-        if blocked:
-            log.info("  skipping clip (%s): %s", ", ".join(sorted(blocked)),
-                     slug.rstrip("/").split("/")[-1][:60])
-            return False
-        return True
+        terms = [t for t in self._words(query).split() if len(t) >= 4]
+        haystack = self._words(text)
+        return sum(1 for t in terms if t[:4] in haystack)
 
-    def fetch_one(self, query: str, tag: str) -> Path | None:
-        """Grab a single clip for a keyword cutaway."""
+    def _blocked(self, text: str) -> set[str]:
+        return set(self._words(text).split()) & set(self.cfg.footage_blocklist)
+
+    # -- library searches, normalised to one shape --------------------------
+
+    def _pexels(self, query: str) -> list[dict[str, Any]]:
         if not self.cfg.pexels_api_key:
-            return None
-        session = requests.Session()
-        session.headers.update({"Authorization": self.cfg.pexels_api_key})
+            return []
         try:
-            resp = session.get(self.SEARCH, timeout=30, params={
-                "query": query, "per_page": 10,
-                "orientation": "portrait", "size": "medium",
-            })
+            resp = requests.get(
+                self.PEXELS, timeout=30,
+                headers={"Authorization": self.cfg.pexels_api_key},
+                params={"query": query, "per_page": 15,
+                        "orientation": "portrait", "size": "medium"},
+            )
+            if resp.status_code == 401:
+                log.error("Pexels rejected PEXELS_API_KEY.")
+                return []
             resp.raise_for_status()
             videos = resp.json().get("videos") or []
         except Exception as exc:
-            log.warning("Cutaway search failed for %r: %s", query, str(exc)[:120])
-            return None
+            log.warning("Pexels search failed for %r: %s", query, str(exc)[:120])
+            return []
 
+        out = []
         for video in videos:
-            vid = video.get("id")
-            if vid in self._used or (video.get("duration") or 0) < 3:
-                continue
-            if not self._acceptable(video):
-                continue
             best = self._best_file(video.get("video_files") or [])
             if not best:
                 continue
-            path = self.workdir / f"cut_{tag}.mp4"
-            if self._stream(best["link"], path, session):
-                self._used.add(vid)
-                return path
-        log.info("No usable cutaway footage for %r.", query)
-        return None
+            # The URL slug is Pexels' own description of the clip.
+            slug = str(video.get("url") or "").rstrip("/").split("/")[-1]
+            out.append({
+                "key": f"pexels:{video.get('id')}",
+                "text": re.sub(r"-\d+$", "", slug).replace("-", " "),
+                "duration": video.get("duration") or 0,
+                "link": best["link"],
+                "source": "pexels",
+            })
+        return out
 
-    def fetch(self, queries: list[str], needed: int) -> list[Path]:
-        if not self.cfg.pexels_api_key:
-            log.info("No PEXELS_API_KEY set - using a generated gradient background.")
+    def _pixabay(self, query: str) -> list[dict[str, Any]]:
+        if not self.cfg.pixabay_api_key:
+            return []
+        try:
+            resp = requests.get(
+                self.PIXABAY, timeout=30,
+                params={"key": self.cfg.pixabay_api_key, "q": query,
+                        "video_type": "film", "per_page": 20, "safesearch": "true"},
+            )
+            resp.raise_for_status()
+            hits = resp.json().get("hits") or []
+        except Exception as exc:
+            log.warning("Pixabay search failed for %r: %s", query, str(exc)[:120])
             return []
 
-        session = requests.Session()
-        session.headers.update({"Authorization": self.cfg.pexels_api_key})
-        clips: list[Path] = []
-        seen_ids: set[int] = self._used
+        out = []
+        for hit in hits:
+            streams = hit.get("videos") or {}
+            # Prefer a stream tall enough to fill 1080x1920 without upscaling.
+            pick = None
+            for name in ("large", "medium", "small", "tiny"):
+                stream = streams.get(name) or {}
+                if stream.get("url") and (stream.get("height") or 0) >= 720:
+                    pick = stream
+                    break
+            if not pick:
+                continue
+            out.append({
+                "key": f"pixabay:{hit.get('id')}",
+                # Pixabay gives explicit tags - a much better relevance signal.
+                "text": str(hit.get("tags") or ""),
+                "duration": hit.get("duration") or 0,
+                "link": pick["url"],
+                "source": "pixabay",
+            })
+        return out
 
-        for query in queries:
+    def _candidates(self, query: str, min_seconds: int) -> list[dict[str, Any]]:
+        """Both libraries, junk removed, best matches first."""
+        pool = self._pixabay(query) + self._pexels(query)
+        scored = []
+        for item in pool:
+            if item["key"] in self._used or item["duration"] < min_seconds:
+                continue
+            blocked = self._blocked(item["text"])
+            if blocked:
+                log.info("  skip [%s] %-38s (blocked: %s)",
+                         item["source"], item["text"][:38], ", ".join(sorted(blocked)))
+                continue
+            score = self._relevance(query, item["text"])
+            if score == 0:
+                log.info("  skip [%s] %-38s (unrelated to %r)",
+                         item["source"], item["text"][:38], query)
+                continue
+            item["score"] = score
+            scored.append(item)
+        scored.sort(key=lambda i: i["score"], reverse=True)
+        return scored
+
+    # -- public API ---------------------------------------------------------
+
+    def fetch(self, queries: list[str], needed: int) -> list[Path]:
+        if not (self.cfg.pexels_api_key or self.cfg.pixabay_api_key):
+            log.info("No footage API key set - using a generated gradient background.")
+            return []
+
+        clips: list[Path] = []
+        shuffled = list(queries)
+        random.shuffle(shuffled)
+
+        for query in shuffled:
             if len(clips) >= needed:
                 break
-            try:
-                resp = session.get(self.SEARCH, timeout=30, params={
-                    "query": query, "per_page": 12,
-                    "orientation": "portrait", "size": "medium",
-                })
-                if resp.status_code == 401:
-                    log.error("Pexels rejected PEXELS_API_KEY - falling back to gradient.")
-                    return []
-                resp.raise_for_status()
-                videos = resp.json().get("videos") or []
-            except Exception as exc:
-                log.warning("Pexels search failed for %r: %s", query, str(exc)[:120])
-                continue
-
-            log.info("Pexels %-28r -> %d result(s)", query, len(videos))
-            for video in videos:
+            candidates = self._candidates(query, min_seconds=4)
+            log.info("%-26r -> %d usable clip(s)", query, len(candidates))
+            for item in candidates:
                 if len(clips) >= needed:
                     break
-                vid = video.get("id")
-                if vid in seen_ids or (video.get("duration") or 0) < 4:
-                    continue
-                if not self._acceptable(video):
-                    continue
-                best = self._best_file(video.get("video_files") or [])
-                if not best:
-                    continue
-                path = self._download(best["link"], len(clips), session)
-                if path:
-                    seen_ids.add(vid)
+                path = self.workdir / f"stock_{len(clips):02d}.mp4"
+                if self._stream(item["link"], path):
+                    self._used.add(item["key"])
                     clips.append(path)
+                    log.info("  using [%s] %s", item["source"], item["text"][:50])
 
         if not clips:
-            log.warning("Pexels returned nothing usable - using a gradient background.")
+            log.warning("Nothing relevant found in any library - using a gradient "
+                        "background instead of unrelated footage.")
         else:
-            log.info("Downloaded %d stock clip(s).", len(clips))
+            log.info("Downloaded %d background clip(s).", len(clips))
         return clips
+
+    def fetch_one(self, query: str, tag: str) -> Path | None:
+        """A single clip for a keyword cutaway."""
+        for item in self._candidates(query, min_seconds=3):
+            path = self.workdir / f"cut_{tag}.mp4"
+            if self._stream(item["link"], path):
+                self._used.add(item["key"])
+                log.info("  cutaway [%s] %s", item["source"], item["text"][:50])
+                return path
+        log.info("No relevant cutaway footage for %r.", query)
+        return None
+
+    # -- downloading --------------------------------------------------------
 
     @staticmethod
     def _best_file(files: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -1336,33 +1407,30 @@ class FootageFetcher:
             return None
         portrait = [f for f in usable if (f.get("height") or 0) > (f.get("width") or 0)]
         pool = portrait or usable
-        # Big enough to fill 1080x1920, but not a needlessly huge download.
         sized = [f for f in pool if 1000 <= (f.get("height") or 0) <= 2200]
         return max(sized or pool, key=lambda f: f.get("height") or 0)
 
-    def _download(self, url: str, index: int, session: requests.Session) -> Path | None:
-        path = self.workdir / f"stock_{index:02d}.mp4"
-        return path if self._stream(url, path, session) else None
-
-    def _stream(self, url: str, path: Path, session: requests.Session) -> bool:
+    def _stream(self, url: str, path: Path) -> bool:
         try:
-            with session.get(url, stream=True, timeout=120) as resp:
+            with requests.get(url, stream=True, timeout=120) as resp:
                 resp.raise_for_status()
                 size = 0
                 with path.open("wb") as handle:
                     for block in resp.iter_content(1 << 16):
                         handle.write(block)
                         size += len(block)
-                        if size > 60 * 1024 * 1024:   # don't let one clip run away
+                        if size > 60 * 1024 * 1024:
                             break
             if path.stat().st_size < 40_000:
                 path.unlink(missing_ok=True)
                 return False
             return True
         except Exception as exc:
-            log.warning("Stock clip download failed: %s", str(exc)[:120])
+            log.warning("Clip download failed: %s", str(exc)[:120])
             path.unlink(missing_ok=True)
             return False
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -1787,25 +1855,37 @@ def new_york_now() -> datetime:
         return datetime.now(timezone.utc)
 
 
-def choose_slot(now: datetime, hours: list[int], grace: int) -> tuple[str, str] | None:
-    """Work out which posting slot a run belongs to.
+def choose_slot(now: datetime, hours: list[int], done: set[str],
+                catch_up_until: int = 20) -> tuple[str, str] | None:
+    """Pick the slot this run should post for.
 
-    GitHub's scheduler routinely delivers runs 30-90 minutes late. Matching on
-    the exact hour therefore throws away perfectly good runs - which is exactly
-    what used to happen. Instead each target hour owns a window that stays open
-    for `grace` minutes, and a late run still counts for the slot it missed.
+    GitHub's scheduler drops runs and delivers others 30-90 minutes late, so
+    tying a run to a narrow window around its target hour loses posts outright.
+    Instead: take the EARLIEST slot whose time has passed today and which has
+    not posted yet. A dropped 10am run is therefore picked up by the next
+    wake-up rather than lost for the day.
+
+    `done` is the set of slot keys already completed, so slots are never
+    repeated, and catch-up stops at `catch_up_until` so a missed morning does
+    not produce a video at midnight.
     """
-    chosen: tuple[str, str] | None = None
+    today = now.strftime("%Y-%m-%d")
+    if now.hour > catch_up_until:
+        return None
+
     for hour in sorted(hours):
-        target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
-        late_by = (now - target).total_seconds() / 60
-        if 0 <= late_by <= grace:
-            name = SLOT_NAMES.get(hour, f"{hour}h")
-            chosen = (f"{now.strftime('%Y-%m-%d')}:{name}", name)
-            if late_by > 5:
-                log.info("This run is %.0f min late for the %s slot - still counting it.",
-                         late_by, name)
-    return chosen
+        if now < now.replace(hour=hour, minute=0, second=0, microsecond=0):
+            continue                      # this slot's time has not arrived yet
+        name = SLOT_NAMES.get(hour, f"{hour}h")
+        key = f"{today}:{name}"
+        if key in done:
+            continue                      # already posted
+        late = (now - now.replace(hour=hour, minute=0, second=0,
+                                  microsecond=0)).total_seconds() / 60
+        if late > 20:
+            log.info("Catching up the %s slot, %.0f min late.", name, late)
+        return key, name
+    return None
 
 
 def write_summary(payload: dict[str, Any]) -> None:
@@ -1849,22 +1929,22 @@ def main() -> int:
     slot_key = ""
     if slot != "manual":
         now = new_york_now()
-        log.info("New York local time: %s", now.strftime("%Y-%m-%d %H:%M"))
-        chosen = choose_slot(now, cfg.post_hours, cfg.grace_minutes)
+        today = now.strftime("%Y-%m-%d")
+        posted = sorted(k.split(":", 1)[1] for k in state.slots if k.startswith(today))
+        log.info("New York local time: %s | posted so far today: %s",
+                 now.strftime("%Y-%m-%d %H:%M"), ", ".join(posted) or "nothing")
+
+        chosen = choose_slot(now, cfg.post_hours, state.slots, cfg.catch_up_until)
         if not chosen:
-            nxt = ", ".join(f"{h}:00" for h in sorted(cfg.post_hours))
-            log.info("Not inside a posting window (targets: %s). Nothing to do.", nxt)
-            write_summary({"result": "outside posting window",
+            targets = ", ".join(f"{h}:00" for h in sorted(cfg.post_hours))
+            log.info("Nothing outstanding (targets: %s). Nothing to do.", targets)
+            write_summary({"result": "nothing outstanding",
                            "local time": now.strftime("%H:%M"),
-                           "targets": nxt})
+                           "posted today": ", ".join(posted) or "nothing",
+                           "targets": targets})
             return 0
         slot_key, slot = chosen
-        log.info("This run counts as the %s slot.", slot)
-        if state.slot_done(slot_key):
-            log.info("The %s slot already posted today - nothing to do.", slot)
-            write_summary({"slot": slot, "result": "already posted today",
-                           "detail": "Backup attempt; this slot already succeeded."})
-            return 0
+        log.info("This run will post the %s slot.", slot)
     workdir = Path(tempfile.mkdtemp(prefix="shorts_"))
     log.info("Working directory: %s", workdir)
 
