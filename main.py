@@ -167,8 +167,11 @@ class Config:
     google_voice: str = "en-US-Chirp3-HD-Charon"
     # Background is deliberately hypnotic filler; cutaways carry the meaning.
     background_queries: list[str] = field(default_factory=list)
-    # Words in a Pexels clip's URL slug that mean "this is about a person".
+    # Strict list for the satisfying background footage.
     footage_blocklist: list[str] = field(default_factory=list)
+    # Light list for topic cutaways - must NOT block laptops, phones, offices
+    # and so on, which are exactly what a tech cutaway wants to show.
+    cutaway_blocklist: list[str] = field(default_factory=list)
     upload_privacy: str = "private"
     # Tried in order. If one is rate limited or retired, the next is used.
     gemini_models: list[str] = field(default_factory=list)
@@ -222,23 +225,41 @@ class Config:
             background_queries=[
                 q.strip() for q in (
                     _env("BACKGROUND_QUERIES",
-                         "marble run,domino chain reaction,soap cutting,kinetic sand cutting,"
-                         "pencil sharpening,wood carving,hydraulic press crushing,"
-                         "paint mixing,slime stretching,laser cutting metal,"
-                         "3d printer printing,glass blowing,sand falling,water beads,"
-                         "chocolate pouring,lathe woodturning")
+                         # Every query names BOTH a material and an action, so
+                         # the all-terms rule can do its job. Single vague words
+                         # like "satisfying" or "sand" pull in scenery.
+                         "soap cutting,cutting soap,soap slicing,kinetic sand cutting,"
+                         "sand slicing,slime stretching,slime mixing,foam cutting,"
+                         "pencil shaving,wood shaving,wood carving,wax carving,"
+                         "clay cutting,resin pouring,paint mixing,glitter mixing,"
+                         "chocolate pouring,marble run,domino falling,"
+                         "hydraulic press crushing,pottery wheel,lathe woodturning,"
+                         "asmr cutting,satisfying slicing")
                     or ""
                 ).split(",") if q.strip()
             ],
             footage_blocklist=[
                 w.strip().lower() for w in (
                     _env("FOOTAGE_BLOCKLIST",
-                         # What someone is DOING - not 'person' or 'hands', so
-                         # 'person carving a pencil' still gets through.
+                         # People doing things, plus scenery - the two ways junk
+                         # has actually got through (waterfalls, feet washing).
                          "eating,drinking,smiling,posing,portrait,model,dancing,selfie,"
                          "couple,family,child,kid,baby,face,makeup,fashion,yoga,workout,"
                          "talking,laughing,walking,sitting,girl,woman,boy,man,teenager,"
-                         "beach,party,office,meeting,phone,laptop")
+                         "feet,foot,washing,cleaning,shower,bath,hair,skin,"
+                         "waterfall,nature,landscape,mountain,forest,ocean,sea,river,"
+                         "beach,sunset,sunrise,sky,cloud,tree,flower,garden,animal,"
+                         "dog,cat,bird,street,city,traffic,car,building,office,party")
+                    or ""
+                ).split(",") if w.strip()
+            ],
+            cutaway_blocklist=[
+                w.strip().lower() for w in (
+                    _env("CUTAWAY_BLOCKLIST",
+                         # Deliberately short: cutaways are topical, so laptops,
+                         # phones, offices and servers must be allowed through.
+                         "selfie,posing,model,portrait,makeup,fashion,dancing,"
+                         "kissing,wedding,baby,toddler")
                     or ""
                 ).split(",") if w.strip()
             ],
@@ -1245,18 +1266,52 @@ class FootageFetcher:
     def _words(text: str) -> str:
         return re.sub(r"[^a-z0-9]+", " ", (text or "").lower())
 
-    def _relevance(self, query: str, text: str) -> int:
-        """How many meaningful words of the query the clip actually matches.
+    # A clip only counts as "satisfying" if it shows one of these actions or
+    # materials. This is the gate that keeps waterfalls and sunsets out.
+    SATISFYING = {
+        "cut", "cutting", "cuts", "slice", "slicing", "sliced", "chop", "chopping",
+        "carve", "carving", "shave", "shaving", "shavings", "peel", "peeling",
+        "crush", "crushing", "press", "squish", "squeeze", "squeezing", "knead",
+        "kneading", "stretch", "stretching", "mix", "mixing", "swirl", "pour",
+        "pouring", "melt", "melting", "soap", "slime", "foam", "wax", "resin",
+        "clay", "kinetic", "sand", "marble", "marbles", "domino", "dominoes",
+        "pencil", "lathe", "pottery", "asmr", "satisfying", "glitter", "paint",
+        "chocolate", "hydraulic", "woodturning", "sculpting", "moulding",
+    }
+    STOPWORDS = {"the", "a", "an", "of", "in", "on", "and", "with", "into"}
 
-        Matched on a 4-character stem so 'cutting' still matches 'cut' and
-        'sliced'. Zero means the library gave us something unrelated.
+    def _terms(self, query: str) -> list[str]:
+        return [t for t in self._words(query).split()
+                if len(t) >= 3 and t not in self.STOPWORDS]
+
+    @staticmethod
+    def _term_hit(term: str, hay_words: list[str]) -> bool:
+        """Prefix match in both directions so 'cutting' finds 'cut'/'cuts'."""
+        stem = term[:5] if len(term) > 5 else term
+        for word in hay_words:
+            if word.startswith(stem) or (len(word) >= 3 and stem.startswith(word[:4])):
+                return True
+        return False
+
+    def _relevance(self, query: str, text: str) -> tuple[int, int]:
+        """(terms matched, terms total).
+
+        Callers decide how many must match. The background demands ALL of them,
+        because accepting one match is what let 'waterfall' through for
+        'water beads' and 'woman washing her feet with soap' through for
+        'soap cutting' - each matched exactly one of two terms.
         """
-        terms = [t for t in self._words(query).split() if len(t) >= 4]
-        haystack = self._words(text)
-        return sum(1 for t in terms if t[:4] in haystack)
+        terms = self._terms(query)
+        if not terms:
+            return 0, 0
+        hay = self._words(text).split()
+        return sum(1 for t in terms if self._term_hit(t, hay)), len(terms)
 
-    def _blocked(self, text: str) -> set[str]:
-        return set(self._words(text).split()) & set(self.cfg.footage_blocklist)
+    def _is_satisfying(self, text: str) -> bool:
+        return bool(set(self._words(text).split()) & self.SATISFYING)
+
+    def _blocked(self, text: str, words: Iterable[str]) -> set[str]:
+        return set(self._words(text).split()) & set(words)
 
     # -- library searches, normalised to one shape --------------------------
 
@@ -1332,25 +1387,51 @@ class FootageFetcher:
             })
         return out
 
-    def _candidates(self, query: str, min_seconds: int) -> list[dict[str, Any]]:
-        """Both libraries, junk removed, best matches first."""
+    def _candidates(self, query: str, min_seconds: int,
+                    mode: str = "background") -> list[dict[str, Any]]:
+        """Both libraries, junk removed, best matches first.
+
+        `mode` matters a lot:
+          background - must be genuinely satisfying-genre footage, so it also
+                       has to contain a word from SATISFYING. Strict on people.
+          cutaway    - must simply match the topic. Only obviously
+                       people-focused clips are blocked, because a cutaway
+                       about tech legitimately wants laptops, phones, offices.
+        """
+        blocklist = (self.cfg.footage_blocklist if mode == "background"
+                     else self.cfg.cutaway_blocklist)
         pool = self._pixabay(query) + self._pexels(query)
         scored = []
+
         for item in pool:
             if item["key"] in self._used or item["duration"] < min_seconds:
                 continue
-            blocked = self._blocked(item["text"])
+            text = item["text"]
+
+            blocked = self._blocked(text, blocklist)
             if blocked:
-                log.info("  skip [%s] %-38s (blocked: %s)",
-                         item["source"], item["text"][:38], ", ".join(sorted(blocked)))
+                log.info("  skip [%s] %-36s (blocked: %s)",
+                         item["source"], text[:36], ", ".join(sorted(blocked)))
                 continue
-            score = self._relevance(query, item["text"])
-            if score == 0:
-                log.info("  skip [%s] %-38s (unrelated to %r)",
-                         item["source"], item["text"][:38], query)
+
+            hits, total = self._relevance(query, text)
+            # Background must match every term; a cutaway only needs about half,
+            # since Gemini's wording rarely matches a stock caption exactly.
+            required = total if mode == "background" else max(1, (total + 1) // 2)
+            if total == 0 or hits < required:
+                log.info("  skip [%s] %-36s (matched %d/%d of %r)",
+                         item["source"], text[:36], hits, total, query)
                 continue
+            score = hits
+
+            if mode == "background" and not self._is_satisfying(text):
+                log.info("  skip [%s] %-36s (not satisfying-genre)",
+                         item["source"], text[:36])
+                continue
+
             item["score"] = score
             scored.append(item)
+
         scored.sort(key=lambda i: i["score"], reverse=True)
         return scored
 
@@ -1388,7 +1469,7 @@ class FootageFetcher:
 
     def fetch_one(self, query: str, tag: str) -> Path | None:
         """A single clip for a keyword cutaway."""
-        for item in self._candidates(query, min_seconds=3):
+        for item in self._candidates(query, min_seconds=3, mode="cutaway"):
             path = self.workdir / f"cut_{tag}.mp4"
             if self._stream(item["link"], path):
                 self._used.add(item["key"])
