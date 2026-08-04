@@ -29,6 +29,10 @@ on:
         type: choice
         options: [private, unlisted, public]
         default: private
+      discover:
+        description: "Find background clips instead of posting. Comma-separated searches, e.g. soap cutting asmr,kinetic sand"
+        type: string
+        default: ""
 
 # Needed so the workflow can commit the 'already used' list back to the repo.
 permissions:
@@ -193,7 +197,9 @@ jobs:
           POST_SLOT: ${{ steps.clock.outputs.slot }}
           LOG_LEVEL: "INFO"
         run: |
-          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+          if [ -n "${{ github.event.inputs.discover }}" ]; then
+            python main.py --discover "${{ github.event.inputs.discover }}"
+          elif [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             python main.py --dry-run
           else
             python main.py
