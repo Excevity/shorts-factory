@@ -162,11 +162,14 @@ class Config:
     # Andrew is accurate but flat; Ava is the most expressive alternative.
     voice: str = "en-US-BrianMultilingualNeural"
     fallback_voice: str = "en-US-AvaMultilingualNeural"
-    speech_rate: str = "+12%"
+    speech_rate: str = "+15%"
+    speech_pitch: str = "+8Hz"
     google_tts_api_key: str | None = None
     google_voice: str = "en-US-Chirp3-HD-Charon"
     # Background is deliberately hypnotic filler; cutaways carry the meaning.
     background_queries: list[str] = field(default_factory=list)
+    # Pixabay video IDs you have personally approved. Set once, used first.
+    curated_clip_ids: list[str] = field(default_factory=list)
     # Strict list for the satisfying background footage.
     footage_blocklist: list[str] = field(default_factory=list)
     # Light list for topic cutaways - must NOT block laptops, phones, offices
@@ -209,6 +212,10 @@ class Config:
             yt_refresh_token=_env("YT_REFRESH_TOKEN", required=not dry_run) or "",
             pexels_api_key=_env("PEXELS_API_KEY"),
             pixabay_api_key=_env("PIXABAY_API_KEY"),
+            curated_clip_ids=[
+                i.strip() for i in (_env("CURATED_CLIP_IDS", "") or "").split(",")
+                if i.strip().isdigit()
+            ],
             feeds=feeds,
             hours_back=_int("HOURS_BACK", 48),
             max_stories=_int("MAX_STORIES", 25),
@@ -218,23 +225,23 @@ class Config:
                    or "en-US-BrianMultilingualNeural"),
             fallback_voice=(_env("TTS_FALLBACK_VOICE", "en-US-AvaMultilingualNeural")
                             or "en-US-AvaMultilingualNeural"),
-            speech_rate=_env("TTS_RATE", "+12%") or "+12%",
+            speech_rate=_env("TTS_RATE", "+15%") or "+15%",
+            speech_pitch=_env("TTS_PITCH", "+8Hz") or "+8Hz",
             google_tts_api_key=_env("GOOGLE_TTS_API_KEY"),
             google_voice=(_env("GOOGLE_TTS_VOICE", "en-US-Chirp3-HD-Charon")
                           or "en-US-Chirp3-HD-Charon"),
             background_queries=[
                 q.strip() for q in (
                     _env("BACKGROUND_QUERIES",
-                         # Every query names BOTH a material and an action, so
-                         # the all-terms rule can do its job. Single vague words
-                         # like "satisfying" or "sand" pull in scenery.
-                         "soap cutting,cutting soap,soap slicing,kinetic sand cutting,"
-                         "sand slicing,slime stretching,slime mixing,foam cutting,"
-                         "pencil shaving,wood shaving,wood carving,wax carving,"
-                         "clay cutting,resin pouring,paint mixing,glitter mixing,"
-                         "chocolate pouring,marble run,domino falling,"
-                         "hydraulic press crushing,pottery wheel,lathe woodturning,"
-                         "asmr cutting,satisfying slicing")
+                         # Terms Pixabay genuinely indexes for this genre.
+                         # 'asmr' alone is the single strongest signal - the tag
+                         # is curated, so anything carrying it is on-genre.
+                         # Avoid pairing a genre word with a generic verb:
+                         # 'asmr cutting' matches every vegetable-chopping clip.
+                         "asmr,kinetic sand,soap cutting,cutting soap,asmr slime,"
+                         "slime,kinetic sand cutting,soap carving,sand cutting,"
+                         "foam cutting,slime stretching,paint mixing,"
+                         "hydraulic press,marble run,pottery wheel")
                     or ""
                 ).split(",") if q.strip()
             ],
@@ -1089,14 +1096,24 @@ class Narrator:
     async def _edge_synth(self, text: str, voice: str, dest: Path) -> list[SpokenWord]:
         import edge_tts  # type: ignore
 
-        communicate = edge_tts.Communicate(text, voice, rate=self.cfg.speech_rate)
+        # Pitch is the strongest lever Edge gives us for character - raising it
+        # a little makes a flat corporate read sound noticeably more animated.
+        try:
+            communicate = edge_tts.Communicate(
+                text, voice, rate=self.cfg.speech_rate, pitch=self.cfg.speech_pitch
+            )
+        except TypeError:
+            communicate = edge_tts.Communicate(text, voice, rate=self.cfg.speech_rate)
         words: list[SpokenWord] = []
         with dest.open("wb") as handle:
             async for chunk in communicate.stream():
-                kind = chunk.get("type")
+                # edge-tts has changed this label between versions, so match
+                # loosely - an exact "WordBoundary" check silently produced
+                # zero timings and forced every caption to be estimated.
+                kind = str(chunk.get("type") or "").lower()
                 if kind == "audio" and chunk.get("data"):
                     handle.write(chunk["data"])
-                elif kind == "WordBoundary":
+                elif "wordboundary" in kind or kind == "word":
                     # Offsets arrive in 100-nanosecond ticks.
                     start = chunk.get("offset", 0) / 10_000_000
                     dur = chunk.get("duration", 0) / 10_000_000
@@ -1120,6 +1137,12 @@ class CaptionBuilder:
     # pushes text off both edges.
     MAX_CHARS = 18
 
+    # ASS colours are &HBBGGRR&, not RGB.
+    YELLOW = r"{\c&H00E5FF&}"      # bright amber-yellow for the key word
+    WHITE = r"{\c&HFFFFFF&}"
+
+    # No background bar: a thick outline plus a real shadow keeps the text
+    # readable on any footage and looks far cleaner.
     ASS_HEADER = textwrap.dedent("""\
         [Script Info]
         ScriptType: v4.00+
@@ -1130,7 +1153,7 @@ class CaptionBuilder:
 
         [V4+ Styles]
         Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-        Style: Pop,{font},78,&H00FFFFFF,&H00FFFFFF,&H00101010,&H90000000,-1,0,0,0,100,100,0,0,1,7,3,2,70,70,560,1
+        Style: Pop,{font},82,&H00FFFFFF,&H00FFFFFF,&H00000000,&HC0000000,-1,0,0,0,100,100,0,0,1,10,5,2,70,70,560,1
 
         [Events]
         Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -1169,13 +1192,42 @@ class CaptionBuilder:
                 flush()
         flush()
 
-        # Close small gaps so captions do not flicker off between phrases.
+        # Hold every caption on screen until the next one begins. Timings are
+        # often estimated rather than measured, and a caption that vanishes
+        # early is what makes subtitles feel like they are racing the voice.
         for i in range(len(chunks) - 1):
-            start, end, text = chunks[i]
-            next_start = chunks[i + 1][0]
-            if 0 < next_start - end < 0.30:
-                chunks[i] = (start, next_start, text)
+            start, _end, text = chunks[i]
+            chunks[i] = (start, chunks[i + 1][0], text)
+        if chunks:
+            start, end, text = chunks[-1]
+            chunks[-1] = (start, end + 0.45, text)
         return chunks
+
+    # Short words carry no meaning, so never highlight these.
+    FILLER = {
+        "the", "a", "an", "and", "but", "or", "of", "to", "in", "on", "at", "it",
+        "is", "was", "are", "be", "for", "with", "that", "this", "you", "your",
+        "just", "so", "if", "as", "by", "from", "has", "had", "have", "not",
+    }
+
+    def _colourise(self, phrase: str) -> str:
+        """Uppercase the phrase and pop its most meaningful word in yellow."""
+        words = phrase.split()
+        if not words:
+            return phrase.upper()
+        best, best_score = -1, 0
+        for i, word in enumerate(words):
+            bare = re.sub(r"[^A-Za-z0-9]", "", word).lower()
+            if not bare or bare in self.FILLER:
+                continue
+            # Longest real word wins; digits are always worth highlighting.
+            score = len(bare) + (6 if any(c.isdigit() for c in bare) else 0)
+            if score > best_score:
+                best, best_score = i, score
+        out = [w.upper() for w in words]
+        if best >= 0:
+            out[best] = f"{self.YELLOW}{out[best]}{self.WHITE}"
+        return " ".join(out)
 
     def write(self, words: list[SpokenWord], dest: Path) -> Path | None:
         chunks = self.group(words)
@@ -1188,7 +1240,7 @@ class CaptionBuilder:
             safe = text.replace("\\", "").replace("{", "(").replace("}", ")")
             lines.append(
                 f"Dialogue: 0,{self._stamp(start)},{self._stamp(end)},Pop,,0,0,0,,"
-                f"{{\\fad(90,90)}}{safe.upper()}"
+                f"{{\\fad(60,60)}}{self._colourise(safe)}"
             )
         dest.write_text("\n".join(lines) + "\n", encoding="utf-8")
         log.info("Captions: %d phrases written.", len(chunks))
@@ -1350,6 +1402,30 @@ class FootageFetcher:
             })
         return out
 
+    def curated(self) -> list[dict[str, Any]]:
+        """Clips you picked yourself, looked up by Pixabay ID.
+
+        Set CURATED_CLIP_IDS once and searching is bypassed entirely for the
+        background. No maintenance, no search roulette, and you know exactly
+        what every video will look like.
+        """
+        ids = self.cfg.curated_clip_ids
+        if not ids or not self.cfg.pixabay_api_key:
+            return []
+        try:
+            resp = requests.get(
+                self.PIXABAY, timeout=30,
+                params={"key": self.cfg.pixabay_api_key, "id": ",".join(ids)},
+            )
+            resp.raise_for_status()
+            hits = resp.json().get("hits") or []
+        except Exception as exc:
+            log.warning("Could not load curated clips: %s", str(exc)[:150])
+            return []
+        out = self._from_pixabay_hits(hits)
+        log.info("Curated list: %d of %d clip(s) available.", len(out), len(ids))
+        return out
+
     def _pixabay(self, query: str) -> list[dict[str, Any]]:
         if not self.cfg.pixabay_api_key:
             return []
@@ -1364,7 +1440,9 @@ class FootageFetcher:
         except Exception as exc:
             log.warning("Pixabay search failed for %r: %s", query, str(exc)[:120])
             return []
+        return self._from_pixabay_hits(hits)
 
+    def _from_pixabay_hits(self, hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
         out = []
         for hit in hits:
             streams = hit.get("videos") or {}
@@ -1400,7 +1478,12 @@ class FootageFetcher:
         """
         blocklist = (self.cfg.footage_blocklist if mode == "background"
                      else self.cfg.cutaway_blocklist)
-        pool = self._pixabay(query) + self._pexels(query)
+        # Pixabay carries the satisfying/ASMR genre and tags it properly;
+        # Pexels barely stocks it and mostly answers with food chopping. So for
+        # backgrounds only fall through to Pexels if Pixabay gave us nothing.
+        pool = self._pixabay(query)
+        if mode != "background" or not pool:
+            pool = pool + self._pexels(query)
         scored = []
 
         for item in pool:
@@ -1443,6 +1526,23 @@ class FootageFetcher:
             return []
 
         clips: list[Path] = []
+
+        # Your approved clips come first. If they cover the video, we never
+        # search at all - which is the whole point of curating them.
+        picked = self.curated()
+        random.shuffle(picked)
+        for item in picked:
+            if len(clips) >= needed:
+                break
+            path = self.workdir / f"stock_{len(clips):02d}.mp4"
+            if self._stream(item["link"], path):
+                self._used.add(item["key"])
+                clips.append(path)
+                log.info("  using [curated] %s", item["text"][:55])
+        if len(clips) >= needed:
+            log.info("Background covered by your curated clips - no search needed.")
+            return clips
+
         shuffled = list(queries)
         random.shuffle(shuffled)
 
@@ -1708,11 +1808,8 @@ class VideoAssembler:
             )
             last = f"ov{index}"
 
-        # A dark band under the captions keeps them readable on any footage.
-        filters.append("color=c=black@0.38:s=%dx270:r=%d[shade]" % (self.WIDTH, self.FPS))
-        filters.append(f"[{last}][shade]overlay=0:H-800:shortest=1[shaded]")
-        last = "shaded"
-
+        # No dark band any more - the caption style carries a thick outline and
+        # shadow instead, which reads just as well and looks far cleaner.
         if captions:
             escaped = str(captions.resolve()).replace("\\", "/").replace(":", r"\:")
             filters.append(f"[{last}]subtitles='{escaped}'[v]")
