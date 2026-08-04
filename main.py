@@ -151,6 +151,10 @@ class Config:
     yt_refresh_token: str
     pexels_api_key: str | None = None       # optional - falls back to gradient
     pixabay_api_key: str | None = None      # optional second footage library
+    # Coverr: a small (~3,600 clip) but well-curated library. Every clip has a
+    # title, a description AND proper tags, plus a vertical flag and a real
+    # resolution - far more to filter on than the other two give us.
+    coverr_api_key: str | None = None
 
     # --- tuning ------------------------------------------------------------
     feeds: list[str] = field(default_factory=list)
@@ -170,6 +174,13 @@ class Config:
     background_queries: list[str] = field(default_factory=list)
     # Pixabay video IDs you have personally approved. Set once, used first.
     curated_clip_ids: list[str] = field(default_factory=list)
+    # A PRIVATE GitHub repo holding clips you downloaded and picked yourself.
+    # This is the best background source: no search, no API roulette, and the
+    # files never appear in your public repo, so stock licences that forbid
+    # redistributing the raw file are respected. "owner/name" format.
+    clip_store_repo: str | None = None
+    clip_store_token: str | None = None     # token that can read that repo
+    clip_store_dir: str = "clips"           # folder inside it holding the MP4s
     # Strict list for the satisfying background footage.
     footage_blocklist: list[str] = field(default_factory=list)
     # Light list for topic cutaways - must NOT block laptops, phones, offices
@@ -212,10 +223,15 @@ class Config:
             yt_refresh_token=_env("YT_REFRESH_TOKEN", required=not dry_run) or "",
             pexels_api_key=_env("PEXELS_API_KEY"),
             pixabay_api_key=_env("PIXABAY_API_KEY"),
+            coverr_api_key=_env("COVERR_API_KEY"),
             curated_clip_ids=[
                 i.strip() for i in (_env("CURATED_CLIP_IDS", "") or "").split(",")
                 if i.strip().isdigit()
             ],
+            clip_store_repo=(_env("CLIP_STORE_REPO", "") or "").strip() or None,
+            clip_store_token=_env("CLIP_STORE_TOKEN"),
+            clip_store_dir=((_env("CLIP_STORE_DIR", "clips") or "clips")
+                            .strip().strip("/") or "clips"),
             feeds=feeds,
             hours_back=_int("HOURS_BACK", 48),
             max_stories=_int("MAX_STORIES", 25),
@@ -1306,11 +1322,24 @@ class FootageFetcher:
 
     PEXELS = "https://api.pexels.com/videos/search"
     PIXABAY = "https://pixabay.com/api/videos/"
+    COVERR = "https://api.coverr.co/videos"
+    GITHUB = "https://api.github.com"
+    CLIP_SUFFIXES = (".mp4", ".mov", ".webm", ".m4v")
+
+    # A free Coverr key allows 50 requests an hour. One run should never get
+    # near that, but a long query list plus cutaways could creep up, and going
+    # over would break the NEXT run too. So we budget it explicitly.
+    COVERR_CALL_BUDGET = 14
+    # Coverr's library is small and well shot; anything below this is either
+    # ancient or a thumbnail-grade file, and looks soft blown up to 1080x1920.
+    COVERR_MIN_HEIGHT = 720
 
     def __init__(self, cfg: Config, workdir: Path) -> None:
         self.cfg = cfg
         self.workdir = workdir
         self._used: set[str] = set()
+        self._coverr_calls = 0
+        self._coverr_cache: dict[str, list[dict[str, Any]]] = {}
 
     # -- relevance and content filtering ------------------------------------
 
@@ -1402,6 +1431,89 @@ class FootageFetcher:
             })
         return out
 
+    def clip_store(self) -> list[dict[str, Any]]:
+        """Clips you downloaded and chose yourself, kept in a private repo.
+
+        This is the best source there is, because it removes the search
+        entirely: you know exactly what every video will look like, and the
+        files sit in a repo only you can see. That last part matters - most
+        free stock licences (Adobe's especially) allow commercial use but
+        forbid redistributing the raw file, which is arguably what committing
+        it to a public repo would be.
+
+        Nothing here costs you Actions minutes. The workflow still runs in
+        your public repo, which has unlimited free minutes; this private repo
+        is only a filing cabinet, and private storage is free.
+        """
+        repo = (self.cfg.clip_store_repo or "").strip().strip("/")
+        token = self.cfg.clip_store_token
+        if not repo or not token:
+            return []
+        if repo.count("/") != 1:
+            log.warning("CLIP_STORE_REPO should look like 'yourname/your-clips', "
+                        "not %r - skipping the clip store.", repo)
+            return []
+
+        folder = self.cfg.clip_store_dir
+        listing = f"{self.GITHUB}/repos/{repo}/contents/{folder}"
+        auth = {"Authorization": f"Bearer {token}",
+                "X-GitHub-Api-Version": "2022-11-28"}
+        try:
+            resp = requests.get(listing, timeout=30,
+                                headers={**auth, "Accept": "application/vnd.github+json"})
+            if resp.status_code in (401, 403):
+                log.warning("CLIP_STORE_TOKEN was rejected by GitHub (%d). Check the "
+                            "token has Contents: Read on %s and has not expired.",
+                            resp.status_code, repo)
+                return []
+            if resp.status_code == 404:
+                log.warning("No '%s' folder in %s - or the token cannot see that repo.",
+                            folder, repo)
+                return []
+            resp.raise_for_status()
+            entries = resp.json()
+        except Exception as exc:
+            log.warning("Could not read the clip store: %s", str(exc)[:150])
+            return []
+
+        if not isinstance(entries, list):
+            log.warning("Expected a folder at %s/%s, got a single file.", repo, folder)
+            return []
+
+        out: list[dict[str, Any]] = []
+        for entry in entries:
+            name = str(entry.get("name") or "")
+            if entry.get("type") != "file":
+                continue
+            if not name.lower().endswith(self.CLIP_SUFFIXES):
+                continue
+            # GitHub's Contents API serves files up to 100 MB with this Accept
+            # header. Anything larger needs the blob API, so flag it clearly
+            # rather than failing with a confusing error later.
+            size = int(entry.get("size") or 0)
+            if size > 100 * 1024 * 1024:
+                log.warning("Skipping %s - %.0f MB is over GitHub's 100 MB "
+                            "download limit. Compress it first.",
+                            name, size / 1024 / 1024)
+                continue
+            out.append({
+                "key": f"store:{name}",
+                # The filename is your own description, so name files
+                # something meaningful if you want readable logs.
+                "text": re.sub(r"[-_]+", " ", Path(name).stem),
+                "duration": 999,          # your own clips are trusted
+                "link": entry.get("url"),  # the API URL, not download_url
+                "headers": {**auth, "Accept": "application/vnd.github.raw"},
+                "source": "clip-store",
+            })
+
+        if out:
+            log.info("Clip store: %d clip(s) in %s/%s.", len(out), repo, folder)
+        else:
+            log.warning("Clip store %s/%s is empty (looking for %s files).",
+                        repo, folder, ", ".join(self.CLIP_SUFFIXES))
+        return out
+
     def curated(self) -> list[dict[str, Any]]:
         """Clips you picked yourself, looked up by Pixabay ID.
 
@@ -1442,6 +1554,100 @@ class FootageFetcher:
             return []
         return self._from_pixabay_hits(hits)
 
+    def _coverr(self, query: str) -> list[dict[str, Any]]:
+        """Coverr search, with the hard quality gates applied up front.
+
+        Coverr is the only one of the three that tells us enough to filter
+        properly. Every clip carries a title, a written description AND a tag
+        list, so we can demand the query match the *tags* - a human-assigned
+        label - rather than hoping a word appears somewhere in a URL slug.
+        It also reports orientation and true resolution, which is how we stop
+        soft, letterboxed footage getting stretched to fill a Short.
+
+        The gates here are the ones no amount of scoring should override:
+        too small, too short, or no downloadable file. Relevance and content
+        filtering happen afterwards in _candidates, shared with the others.
+        """
+        if not self.cfg.coverr_api_key:
+            return []
+        if query in self._coverr_cache:
+            return self._coverr_cache[query]
+        if self._coverr_calls >= self.COVERR_CALL_BUDGET:
+            log.info("Coverr call budget for this run is used up - skipping %r.", query)
+            return []
+
+        self._coverr_calls += 1
+        try:
+            resp = requests.get(
+                self.COVERR, timeout=30,
+                headers={"Authorization": f"Bearer {self.cfg.coverr_api_key}"},
+                params={"query": query, "page_size": 20,
+                        "sort": "popular", "urls": "true"},
+            )
+            if resp.status_code in (401, 403):
+                log.error("Coverr rejected COVERR_API_KEY (%d).", resp.status_code)
+                self.cfg.coverr_api_key = None      # stop retrying this run
+                return []
+            if resp.status_code == 429:
+                log.warning("Coverr rate limit hit (50/hour on a free key) - "
+                            "backing off for the rest of this run.")
+                self._coverr_calls = self.COVERR_CALL_BUDGET
+                return []
+            resp.raise_for_status()
+            hits = (resp.json() or {}).get("hits") or []
+        except Exception as exc:
+            log.warning("Coverr search failed for %r: %s", query, str(exc)[:120])
+            return []
+
+        out: list[dict[str, Any]] = []
+        for hit in hits:
+            link = ((hit.get("urls") or {}).get("mp4") or "").strip()
+            height = int(hit.get("max_height") or 0)
+            if not link or not hit.get("id"):
+                continue
+            if height < self.COVERR_MIN_HEIGHT:
+                log.info("  skip [coverr] %-36s (only %dp)",
+                         str(hit.get("title") or "")[:36], height)
+                continue
+
+            tags = [str(t) for t in (hit.get("tags") or [])]
+            # Tags are human-assigned and are the trustworthy signal. Title and
+            # description are prose and drag in loose matches, so they are kept
+            # for blocklisting but weighted lower for relevance.
+            out.append({
+                "key": f"coverr:{hit['id']}",
+                "text": " ".join([*tags, str(hit.get("title") or ""),
+                                  str(hit.get("description") or "")]),
+                "tags": " ".join(tags),
+                "duration": float(hit.get("duration") or 0),
+                "link": link,
+                "source": "coverr",
+                "coverr_id": str(hit["id"]),
+                # Vertical needs no cropping, so it survives at full detail.
+                # This is the single biggest quality difference in a Short.
+                "bonus": (3 if hit.get("is_vertical") else 0) + (1 if height >= 1080 else 0),
+            })
+
+        self._coverr_cache[query] = out
+        return out
+
+    def _ping_coverr_download(self, video_id: str) -> None:
+        """Coverr require this, and say they audit partners for it.
+
+        From their docs: "pinging the mp4_download is a MUST and not optional
+        since it really improves our feedback loop". It is a stats call, so a
+        failure must never take the run down with it.
+        """
+        if not self.cfg.coverr_api_key or not video_id:
+            return
+        try:
+            requests.patch(
+                f"{self.COVERR}/{video_id}/stats/downloads", timeout=15,
+                headers={"Authorization": f"Bearer {self.cfg.coverr_api_key}"},
+            )
+        except Exception as exc:
+            log.debug("Coverr download ping failed (harmless): %s", str(exc)[:100])
+
     def _from_pixabay_hits(self, hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
         out = []
         for hit in hits:
@@ -1481,7 +1687,7 @@ class FootageFetcher:
         # Pixabay carries the satisfying/ASMR genre and tags it properly;
         # Pexels barely stocks it and mostly answers with food chopping. So for
         # backgrounds only fall through to Pexels if Pixabay gave us nothing.
-        pool = self._pixabay(query)
+        pool = self._pixabay(query) + self._coverr(query)
         if mode != "background" or not pool:
             pool = pool + self._pexels(query)
         scored = []
@@ -1505,7 +1711,19 @@ class FootageFetcher:
                 log.info("  skip [%s] %-36s (matched %d/%d of %r)",
                          item["source"], text[:36], hits, total, query)
                 continue
-            score = hits
+            score = hits + int(item.get("bonus") or 0)
+
+            # Where a source gives us human-assigned tags, insist the match is
+            # in the TAGS and not only in the prose description. "A man relaxes
+            # by a fountain" contains 'water' and would otherwise sail through
+            # a search for water beads; its tags say fountain, park, leisure.
+            if item.get("tags") is not None:
+                tag_hits, _ = self._relevance(query, item["tags"])
+                if mode == "background" and tag_hits < required:
+                    log.info("  skip [%s] %-36s (matched %d/%d in tags only)",
+                             item["source"], text[:36], tag_hits, total)
+                    continue
+                score += 2 if tag_hits >= required else 0
 
             if mode == "background" and not self._is_satisfying(text):
                 log.info("  skip [%s] %-36s (not satisfying-genre)",
@@ -1520,29 +1738,54 @@ class FootageFetcher:
 
     # -- public API ---------------------------------------------------------
 
-    def fetch(self, queries: list[str], needed: int) -> list[Path]:
-        if not (self.cfg.pexels_api_key or self.cfg.pixabay_api_key):
-            log.info("No footage API key set - using a generated gradient background.")
-            return []
+    def _after_download(self, item: dict[str, Any]) -> None:
+        """Whatever a library asks us to do once we've actually taken a file."""
+        if item.get("source") == "coverr":
+            self._ping_coverr_download(item.get("coverr_id") or "")
 
-        clips: list[Path] = []
-
-        # Your approved clips come first. If they cover the video, we never
-        # search at all - which is the whole point of curating them.
-        picked = self.curated()
-        random.shuffle(picked)
-        for item in picked:
+    def _take(self, items: list[dict[str, Any]], clips: list[Path],
+              needed: int, label: str) -> None:
+        """Download from an already-chosen list until we have enough."""
+        for item in items:
             if len(clips) >= needed:
                 break
             path = self.workdir / f"stock_{len(clips):02d}.mp4"
-            if self._stream(item["link"], path):
+            if self._stream(item["link"], path, item.get("headers")):
                 self._used.add(item["key"])
                 clips.append(path)
-                log.info("  using [curated] %s", item["text"][:55])
+                self._after_download(item)
+                log.info("  using [%s] %s", label, item["text"][:55])
+
+    def fetch(self, queries: list[str], needed: int) -> list[Path]:
+        clips: list[Path] = []
+
+        # 1. Your own private clip store wins outright. If it has anything at
+        #    all we stop here, even with fewer clips than asked for: the
+        #    assembler loops what it gets, and a short loop of footage you
+        #    chose beats a longer one padded out with search results.
+        store = self.clip_store()
+        random.shuffle(store)
+        self._take(store, clips, needed, "clip-store")
+        if clips:
+            log.info("Background covered by your clip store (%d clip(s)) - "
+                     "no search needed.", len(clips))
+            return clips
+
+        if not (self.cfg.pexels_api_key or self.cfg.pixabay_api_key
+                or self.cfg.coverr_api_key):
+            log.info("No clip store and no footage API key - using a generated "
+                     "gradient background.")
+            return []
+
+        # 2. Pixabay IDs you approved by hand.
+        picked = self.curated()
+        random.shuffle(picked)
+        self._take(picked, clips, needed, "curated")
         if len(clips) >= needed:
             log.info("Background covered by your curated clips - no search needed.")
             return clips
 
+        # 3. Last resort: search, and hope.
         shuffled = list(queries)
         random.shuffle(shuffled)
 
@@ -1571,8 +1814,9 @@ class FootageFetcher:
         """A single clip for a keyword cutaway."""
         for item in self._candidates(query, min_seconds=3, mode="cutaway"):
             path = self.workdir / f"cut_{tag}.mp4"
-            if self._stream(item["link"], path):
+            if self._stream(item["link"], path, item.get("headers")):
                 self._used.add(item["key"])
+                self._after_download(item)
                 log.info("  cutaway [%s] %s", item["source"], item["text"][:50])
                 return path
         log.info("No relevant cutaway footage for %r.", query)
@@ -1591,17 +1835,31 @@ class FootageFetcher:
         sized = [f for f in pool if 1000 <= (f.get("height") or 0) <= 2200]
         return max(sized or pool, key=lambda f: f.get("height") or 0)
 
-    def _stream(self, url: str, path: Path) -> bool:
+    # Clips bigger than this are rejected rather than cut short. Stopping a
+    # download part-way leaves a truncated MP4 that FFmpeg may still half-read,
+    # which used to produce a background that ended early for no visible reason.
+    MAX_CLIP_BYTES = 90 * 1024 * 1024
+
+    def _stream(self, url: str, path: Path,
+                headers: dict[str, str] | None = None) -> bool:
         try:
-            with requests.get(url, stream=True, timeout=120) as resp:
+            with requests.get(url, stream=True, timeout=180,
+                              headers=headers or {}) as resp:
                 resp.raise_for_status()
                 size = 0
+                oversized = False
                 with path.open("wb") as handle:
                     for block in resp.iter_content(1 << 16):
                         handle.write(block)
                         size += len(block)
-                        if size > 60 * 1024 * 1024:
+                        if size > self.MAX_CLIP_BYTES:
+                            oversized = True
                             break
+            if oversized:
+                log.warning("Clip is over %d MB - skipping it rather than using a "
+                            "half-downloaded file.", self.MAX_CLIP_BYTES // 1024 // 1024)
+                path.unlink(missing_ok=True)
+                return False
             if path.stat().st_size < 40_000:
                 path.unlink(missing_ok=True)
                 return False
