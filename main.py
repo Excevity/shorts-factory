@@ -2080,13 +2080,78 @@ def write_summary(payload: dict[str, Any]) -> None:
         pass
 
 
+def discover(cfg: Config, queries: list[str]) -> int:
+    """List candidate background clips so you can pick IDs without a browser.
+
+    Pixabay's website blocks some regions with a 503, but the API answers
+    fine from a GitHub runner - so let the runner do the browsing and print
+    a table you choose from.
+    """
+    if not cfg.pixabay_api_key:
+        log.error("PIXABAY_API_KEY is not set - cannot search for clips.")
+        return 2
+
+    fetcher = FootageFetcher(cfg, Path(tempfile.mkdtemp(prefix="discover_")))
+    rows: list[str] = []
+    seen: set[str] = set()
+
+    for query in queries:
+        hits = fetcher._pixabay(query)
+        kept = 0
+        for item in hits:
+            vid = item["key"].split(":")[1]
+            if vid in seen:
+                continue
+            blocked = fetcher._blocked(item["text"], cfg.footage_blocklist)
+            genre = fetcher._is_satisfying(item["text"])
+            if blocked or not genre:
+                continue
+            seen.add(vid)
+            kept += 1
+            rows.append(f"| `{vid}` | {int(item['duration'])}s | {item['text'][:70]} | "
+                        f"https://pixabay.com/videos/id-{vid}/ |")
+        log.info("%-28r -> %d good clip(s)", query, kept)
+
+    if not rows:
+        log.warning("Nothing matched. Try broader queries.")
+        return 0
+
+    ids = ",".join(sorted(r.split("`")[1] for r in rows))
+    log.info("\nPaste this into CURATED_CLIP_IDS:\n%s", ids)
+
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if path:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write("## Candidate background clips\n\n")
+            handle.write("Preview any of these, delete the ones you dislike, then "
+                         "paste the rest into `CURATED_CLIP_IDS` in `automate.yml`.\n\n")
+            handle.write("```\n" + ids + "\n```\n\n")
+            handle.write("| ID | Length | Tags | Preview |\n|---|---|---|---|\n")
+            handle.write("\n".join(rows) + "\n")
+    log.info("Found %d clip(s). See the run summary for a table with preview links.",
+             len(rows))
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Automated original-content Shorts factory.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Build the video but do not upload it.")
     parser.add_argument("--keep-temp", action="store_true",
                         help="Do not delete the temporary working directory.")
+    parser.add_argument("--discover", metavar="QUERIES",
+                        help="Search for background clips and print their IDs "
+                             "instead of making a video. Comma-separated.")
     args = parser.parse_args()
+
+    if args.discover:
+        try:
+            cfg = Config.from_env(dry_run=True)
+        except ConfigError as exc:
+            log.error("%s", exc)
+            return 2
+        wanted = [q.strip() for q in args.discover.split(",") if q.strip()]
+        return discover(cfg, wanted or cfg.background_queries)
 
     started = time.time()
     try:
