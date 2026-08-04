@@ -152,7 +152,16 @@ jobs:
           # Every query names a MATERIAL and an ACTION. A clip must match both
           # words AND contain a satisfying-genre word, or it is rejected.
           # Vague queries like "satisfying" or "sand" pull in scenery - avoid.
-          BACKGROUND_QUERIES: "soap cutting,cutting soap,soap slicing,kinetic sand cutting,sand slicing,slime stretching,slime mixing,foam cutting,pencil shaving,wood shaving,wood carving,wax carving,clay cutting,resin pouring,paint mixing,glitter mixing,chocolate pouring,marble run,domino falling,hydraulic press crushing,pottery wheel,lathe woodturning,asmr cutting,satisfying slicing"
+          # Clips YOU approved, by Pixabay video ID. Set this once and the
+          # background stops being a lottery - these are used before any search.
+          # To add one: open a Pixabay video page and copy the number at the end
+          # of the URL, e.g. .../videos/kinetic-sand-sand-cutting-asmr-144459/
+          CURATED_CLIP_IDS: "144459"
+          # Fallback searches, used only if the curated list runs short.
+          # 'asmr' alone is the strongest signal - Pixabay curates that tag.
+          # Never pair a genre word with a generic verb: 'asmr cutting' matches
+          # every vegetable-chopping clip on the site.
+          BACKGROUND_QUERIES: "asmr,kinetic sand,soap cutting,cutting soap,asmr slime,slime,kinetic sand cutting,soap carving,sand cutting,foam cutting,slime stretching,paint mixing,hydraulic press,marble run,pottery wheel"
           # Applies to the BACKGROUND only. Blocks people-shots and scenery -
           # the two ways junk actually got through (waterfalls, feet washing).
           FOOTAGE_BLOCKLIST: "eating,drinking,smiling,posing,portrait,model,dancing,selfie,couple,family,child,kid,baby,face,makeup,fashion,yoga,workout,talking,laughing,walking,sitting,girl,woman,boy,man,teenager,feet,foot,washing,cleaning,shower,bath,hair,skin,waterfall,nature,landscape,mountain,forest,ocean,sea,river,beach,sunset,sunrise,sky,cloud,tree,flower,garden,animal,dog,cat,bird,street,city,traffic,car,building,office,party"
@@ -169,8 +178,11 @@ jobs:
           #   en-US-AndrewMultilingualNeural (male, measured - the flat one)
           TTS_VOICE: "en-US-BrianMultilingualNeural"
           TTS_FALLBACK_VOICE: "en-US-AvaMultilingualNeural"
-          # Brainrot pacing. +0% is natural, +20% is very fast.
-          TTS_RATE: "+12%"
+          # Brainrot pacing. +0% is natural, +25% is very fast.
+          TTS_RATE: "+15%"
+          # Pitch is the biggest character lever Edge offers. +0Hz is the flat
+          # default; +8Hz is livelier; +20Hz gets cartoonish. Negative goes deep.
+          TTS_PITCH: "+8Hz"
           # The value after || is what SCHEDULED runs use. The part before it
           # only applies to manual runs, where you pick from the dropdown.
           # Set to 'private' if you ever want to review before publishing.
