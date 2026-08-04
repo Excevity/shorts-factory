@@ -46,7 +46,7 @@ concurrency:
 jobs:
   create-and-post:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 40
 
     steps:
       # ---------------------------------------------------------------
@@ -90,25 +90,58 @@ jobs:
 
       - name: Install Python dependencies
         if: steps.clock.outputs.run == 'true'
+        timeout-minutes: 8
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Verify FFmpeg and caption fonts
         if: steps.clock.outputs.run == 'true'
+        # Hard ceiling. Without this a hung package manager can burn the whole
+        # job - which is exactly what happened: apt waited forever on a lock
+        # held by the runner's background updater.
+        timeout-minutes: 8
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
+          set -u
+
+          apt_install() {
+            # -o DPkg::Lock::Timeout makes apt give up on the lock instead of
+            # blocking forever; timeout is a second belt in case it still hangs.
+            sudo timeout 150 apt-get -o DPkg::Lock::Timeout=60 update -qq || return 1
+            sudo timeout 200 apt-get -o DPkg::Lock::Timeout=60 \
+                 install -y -qq --no-install-recommends "$@" || return 1
+          }
+
           if ! command -v ffmpeg >/dev/null 2>&1; then
-            echo "FFmpeg missing on this runner image - installing it."
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq ffmpeg
+            echo "FFmpeg missing on this runner image."
+            if apt_install ffmpeg; then
+              echo "Installed FFmpeg via apt."
+            else
+              # apt is unreliable on hosted runners; a static build needs no
+              # package manager, no lock, and no root.
+              echo "apt failed or timed out - fetching a static FFmpeg build."
+              mkdir -p "$HOME/bin"
+              curl -fsSL --retry 3 --max-time 240 -o /tmp/ffmpeg.tar.xz \
+                https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+              tar -xJf /tmp/ffmpeg.tar.xz -C /tmp
+              cp /tmp/ffmpeg-*/bin/ffmpeg /tmp/ffmpeg-*/bin/ffprobe "$HOME/bin/"
+              chmod +x "$HOME/bin/ffmpeg" "$HOME/bin/ffprobe"
+              echo "$HOME/bin" >> "$GITHUB_PATH"
+              export PATH="$HOME/bin:$PATH"
+            fi
           fi
+
           # Burned-in captions need a real font installed, not just FFmpeg.
           if ! fc-list 2>/dev/null | grep -qi "DejaVu Sans"; then
-            echo "DejaVu font missing - installing it."
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq fonts-dejavu-core fontconfig
+            echo "DejaVu font missing - trying to install it."
+            apt_install fonts-dejavu-core fontconfig || \
+              echo "WARNING: could not install fonts; captions may fall back."
           fi
+
           ffmpeg -version | head -n 1
+          ffprobe -version | head -n 1
           ffmpeg -hide_banner -filters | grep -q " subtitles " \
             && echo "subtitles filter: OK" \
             || echo "WARNING: FFmpeg has no subtitles filter - captions will be skipped"
@@ -119,6 +152,7 @@ jobs:
       # ---------------------------------------------------------------
       - name: Refresh the processed-videos list
         if: steps.clock.outputs.run == 'true'
+        timeout-minutes: 3
         run: git pull --ff-only origin "${GITHUB_REF_NAME}" || true
 
       # ---------------------------------------------------------------
@@ -126,6 +160,7 @@ jobs:
       # ---------------------------------------------------------------
       - name: Run the Shorts Factory (${{ steps.clock.outputs.slot }} slot)
         if: steps.clock.outputs.run == 'true'
+        timeout-minutes: 14
         env:
           # --- required secrets -------------------------------------
           GEMINI_API_KEY:      ${{ secrets.GEMINI_API_KEY }}
@@ -222,6 +257,7 @@ jobs:
       # ---------------------------------------------------------------
       - name: Commit the processed-videos list
         if: steps.clock.outputs.run == 'true' && always()
+        timeout-minutes: 3
         run: |
           if [ -f state/processed.json ]; then
             git config user.name  "shorts-factory-bot"
