@@ -174,6 +174,27 @@ jobs:
           #     Pixabay carries more amateur/ASMR-style clips than Pexels and
           #     exposes proper tags, so relevance filtering works better on it.
           PIXABAY_API_KEY:     ${{ secrets.PIXABAY_API_KEY }}
+          # --- optional third library, and the best-filtered of the three.
+          #     Small (~3,600 clips) but every one has human-written tags, a
+          #     vertical flag and a real resolution, so the script can demand
+          #     the search term appear in the TAGS rather than anywhere in a
+          #     URL slug. Free key: coverr.co/developers. 50 requests/hour.
+          COVERR_API_KEY:      ${{ secrets.COVERR_API_KEY }}
+          # --- your own hand-picked background clips (strongly recommended).
+          #     A PRIVATE repo you fill yourself from Mixkit, Adobe Stock's
+          #     free collection, or anywhere else. If it has clips in it,
+          #     searching is skipped entirely and every video uses footage you
+          #     actually chose. Private because most free stock licences allow
+          #     commercial use but forbid redistributing the raw file, which a
+          #     public repo arguably does. Costs no extra Actions minutes -
+          #     the workflow still runs here, in the public repo.
+          #     See "Your own clip store" in the README for setup.
+          CLIP_STORE_TOKEN:    ${{ secrets.CLIP_STORE_TOKEN }}
+          # Put YOUR github username and the private repo's name here, e.g.
+          # "ege/shorts-clips". Leave it empty to turn the clip store off.
+          # This is not a secret - a private repo just 404s to everyone else.
+          CLIP_STORE_REPO:     ""
+          CLIP_STORE_DIR:      "clips"
           # --- optional: Google Cloud TTS. Better voice, but Google requires a
           #     billing account (card on file) even for its free tier, so this
           #     is left unset by default. Unset = the free Edge voice is used.
