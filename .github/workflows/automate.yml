@@ -149,12 +149,17 @@ jobs:
           # Background is deliberately hypnotic filler that holds attention;
           # the keyword cutaways carry the actual meaning. Specific object-based
           # searches beat vague ones - "oddly satisfying" returns random people.
-          BACKGROUND_QUERIES: "soap cutting,cutting soap,kinetic sand cutting,slime,asmr,pencil sharpening,wood carving,wood shaving,marble run,dominoes falling,hydraulic press,paint mixing,glass blowing,pottery wheel,lathe turning,foam cutting,ice cutting,candle making,resin pouring,chocolate pouring"
-          # Pexels names each clip in its URL, e.g. /video/a-woman-eating-chips-123/.
-          # Any clip whose name contains one of these words is skipped before
-          # download. Targets what a person is DOING, so "person carving a
-          # pencil" and "hands shaping clay" still get through.
-          FOOTAGE_BLOCKLIST: "eating,drinking,smiling,posing,portrait,model,dancing,selfie,couple,family,child,kid,baby,face,makeup,fashion,yoga,workout,talking,laughing,walking,sitting,girl,woman,boy,man,teenager,beach,party,office,meeting,phone,laptop"
+          # Every query names a MATERIAL and an ACTION. A clip must match both
+          # words AND contain a satisfying-genre word, or it is rejected.
+          # Vague queries like "satisfying" or "sand" pull in scenery - avoid.
+          BACKGROUND_QUERIES: "soap cutting,cutting soap,soap slicing,kinetic sand cutting,sand slicing,slime stretching,slime mixing,foam cutting,pencil shaving,wood shaving,wood carving,wax carving,clay cutting,resin pouring,paint mixing,glitter mixing,chocolate pouring,marble run,domino falling,hydraulic press crushing,pottery wheel,lathe woodturning,asmr cutting,satisfying slicing"
+          # Applies to the BACKGROUND only. Blocks people-shots and scenery -
+          # the two ways junk actually got through (waterfalls, feet washing).
+          FOOTAGE_BLOCKLIST: "eating,drinking,smiling,posing,portrait,model,dancing,selfie,couple,family,child,kid,baby,face,makeup,fashion,yoga,workout,talking,laughing,walking,sitting,girl,woman,boy,man,teenager,feet,foot,washing,cleaning,shower,bath,hair,skin,waterfall,nature,landscape,mountain,forest,ocean,sea,river,beach,sunset,sunrise,sky,cloud,tree,flower,garden,animal,dog,cat,bird,street,city,traffic,car,building,office,party"
+          # Applies to keyword CUTAWAYS only, and is deliberately short: a tech
+          # cutaway legitimately wants laptops, phones, offices and servers.
+          # The long list above was silently killing every cutaway.
+          CUTAWAY_BLOCKLIST: "selfie,posing,model,portrait,makeup,fashion,dancing,kissing,wedding,baby,toddler"
           # Only used if you ever set GOOGLE_TTS_API_KEY.
           GOOGLE_TTS_VOICE: "en-US-Chirp3-HD-Charon"
           # The actual narrator. Brian Multilingual is the most conversational
